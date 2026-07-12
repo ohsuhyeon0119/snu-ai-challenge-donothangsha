@@ -14,7 +14,7 @@ import pandas as pd
 import torch
 from qwen_vl_utils import process_vision_info
 
-from lora_finetune import build_example, TRAIN_IMG_DIR, ADAPTER_OUT_DIR
+from lora_finetune import build_example, TRAIN_IMG_DIR, ADAPTER_OUT_DIR, VAL_SPLIT_CSV
 
 
 def parse_image_order(generated_text):
@@ -50,7 +50,7 @@ def generate_prediction(model, processor, row, image_dir):
 
 
 def evaluate(model, processor):
-    val_df = pd.read_csv("/content/lora_val_split.csv")
+    val_df = pd.read_csv(VAL_SPLIT_CSV)
     preds, truths = [], []
     for _, row in val_df.iterrows():
         pred = generate_prediction(model, processor, row, TRAIN_IMG_DIR)

@@ -21,13 +21,14 @@ Kaggle notebook setup: the dataset is usually already mounted under
 /kaggle/input/<competition-slug>/ — set DATA_DIR to that path instead.
 """
 import ast
+import json
 import time
 from pathlib import Path
 
 import pandas as pd
 import torch
 from transformers import BitsAndBytesConfig, Qwen2VLForConditionalGeneration, AutoProcessor
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 
 # --- adjust this for the notebook environment ---
@@ -35,7 +36,12 @@ DATA_DIR = Path("/content/data/snuaichallenge_data")   # Colab default; use
                                                           # /kaggle/input/<slug>/ on Kaggle
 TRAIN_CSV = DATA_DIR / "train.csv"
 TRAIN_IMG_DIR = DATA_DIR / "train"
-ADAPTER_OUT_DIR = Path("/content/qwen2vl_lora_adapter")   # Colab default output location
+# Must be on Google Drive, not /content — /content is wiped whenever the
+# Colab session disconnects (idle timeout, 12h cap, GPU reclaim), which
+# would silently erase every checkpoint. Mount Drive first:
+#   from google.colab import drive; drive.mount('/content/drive')
+ADAPTER_OUT_DIR = Path("/content/drive/MyDrive/qwen2vl_lora_adapter")
+VAL_SPLIT_CSV = Path("/content/drive/MyDrive/lora_val_split.csv")
 
 MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
 VAL_FRAC = 0.12
@@ -79,11 +85,15 @@ def load_model_and_processor():
     )
     processor = AutoProcessor.from_pretrained(MODEL_NAME)
 
-    lora_config = LoraConfig(
-        r=16, lora_alpha=32, lora_dropout=0.05,
-        target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(base_model, lora_config)
+    if (ADAPTER_OUT_DIR / "adapter_config.json").exists():
+        print(f"found existing adapter at {ADAPTER_OUT_DIR}, resuming from it")
+        model = PeftModel.from_pretrained(base_model, ADAPTER_OUT_DIR, is_trainable=True)
+    else:
+        lora_config = LoraConfig(
+            r=16, lora_alpha=32, lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(base_model, lora_config)
     model.print_trainable_parameters()
     return model, processor
 
@@ -92,9 +102,20 @@ def train(model, processor, train_df):
     optim = torch.optim.AdamW(model.parameters(), lr=LR)
     model.train()
 
+    ADAPTER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    progress_path = ADAPTER_OUT_DIR / "progress.json"
+    start_step = 0
+    if progress_path.exists():
+        start_step = json.loads(progress_path.read_text())["step"]
+        print(f"resuming: skipping the first {start_step} rows already trained on")
+
     step = 0
     for epoch in range(N_EPOCHS):
         for _, row in train_df.iterrows():
+            step += 1
+            if step <= start_step:
+                continue   # already trained on this row in a previous session
+
             messages, target_text = build_example(row, TRAIN_IMG_DIR)
             text = processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
@@ -111,14 +132,15 @@ def train(model, processor, train_df):
             optim.step()
             optim.zero_grad()
 
-            step += 1
             if step % 50 == 0:
                 print(f"epoch {epoch} step {step}: loss={outputs.loss.item():.4f}")
             if step % CHECKPOINT_EVERY_N_ROWS == 0:
                 model.save_pretrained(ADAPTER_OUT_DIR)
+                progress_path.write_text(json.dumps({"step": step}))
                 print(f"checkpointed adapter at step {step} -> {ADAPTER_OUT_DIR}")
 
     model.save_pretrained(ADAPTER_OUT_DIR)
+    progress_path.write_text(json.dumps({"step": step}))
     print(f"final adapter saved -> {ADAPTER_OUT_DIR}")
 
 
@@ -132,7 +154,8 @@ if __name__ == "__main__":
     )
     train_df = train_df.reset_index(drop=True)
     val_df = val_df.reset_index(drop=True)
-    val_df.to_csv("/content/lora_val_split.csv", index=False)  # reused for evaluation
+    VAL_SPLIT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    val_df.to_csv(VAL_SPLIT_CSV, index=False)  # reused by lora_eval.py
 
     model, processor = load_model_and_processor()
 
