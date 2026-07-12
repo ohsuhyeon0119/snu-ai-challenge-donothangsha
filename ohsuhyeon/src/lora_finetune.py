@@ -2,26 +2,31 @@
 Track B (stretch): LoRA-finetune the organizer's baseline model
 (Qwen2-VL-2B-Instruct) on train.csv.
 
-This is meant to be run in a cloud GPU notebook (Colab or Kaggle), NOT
-locally (the dev machine has no CUDA GPU). Copy this file's contents into
-a notebook cell, or `!python lora_finetune.py` after adjusting DATA_DIR
-below to wherever the notebook mounted the competition data.
+This is meant to be run on a cloud GPU (Vast.ai, Colab, or Kaggle), NOT
+locally (the dev machine has no CUDA GPU).
 
-Colab setup (run once, in a cell, before this script):
-    !pip install -q peft accelerate qwen-vl-utils bitsandbytes
-    !pip install -q kaggle
-    # upload kaggle.json (Kaggle Settings -> API -> Create New Token) first
-    import os
-    os.environ['KAGGLE_CONFIG_DIR'] = '/content'
-    !kaggle competitions download -c <competition-slug> -p /content/data
-    !unzip -q /content/data/*.zip -d /content/data
-    # then set DATA_DIR below to "/content/data/snuaichallenge_data"
+All paths are overridable via env vars so the same script runs unchanged
+on any of those platforms:
+    SNU_DATA_DIR      (default /workspace/data/snuaichallenge_data — Vast.ai)
+    SNU_ADAPTER_DIR   (default /workspace/qwen2vl_lora_adapter)
+    SNU_VAL_SPLIT_CSV (default /workspace/lora_val_split.csv)
+    SNU_BATCH_SIZE    (default 1 — Qwen2's ~152k vocab makes the cross-entropy
+                       logits tensor scale directly with batch_size * seq_len;
+                       batch_size=2 already OOMs a 24GB card here even with
+                       gradient checkpointing on, so batching isn't viable for
+                       this model on this hardware — kept as a knob for a
+                       bigger GPU, not because it currently helps)
 
-Kaggle notebook setup: the dataset is usually already mounted under
-/kaggle/input/<competition-slug>/ — set DATA_DIR to that path instead.
+Colab: /content is wiped on every session disconnect, so point
+SNU_ADAPTER_DIR/SNU_VAL_SPLIT_CSV at a mounted Google Drive path instead,
+e.g. `export SNU_ADAPTER_DIR=/content/drive/MyDrive/qwen2vl_lora_adapter`
+(after `from google.colab import drive; drive.mount('/content/drive')`).
+Kaggle: the dataset is usually already mounted under
+/kaggle/input/<competition-slug>/ — point SNU_DATA_DIR there.
 """
 import ast
 import json
+import os
 import time
 from pathlib import Path
 
@@ -31,25 +36,21 @@ from transformers import BitsAndBytesConfig, Qwen2VLForConditionalGeneration, Au
 from peft import LoraConfig, PeftModel, get_peft_model
 from qwen_vl_utils import process_vision_info
 
-# --- adjust this for the notebook environment ---
-DATA_DIR = Path("/content/data/snuaichallenge_data")   # Colab default; use
-                                                          # /kaggle/input/<slug>/ on Kaggle
+DATA_DIR = Path(os.environ.get("SNU_DATA_DIR", "/workspace/data/snuaichallenge_data"))
 TRAIN_CSV = DATA_DIR / "train.csv"
 TRAIN_IMG_DIR = DATA_DIR / "train"
-# Must be on Google Drive, not /content — /content is wiped whenever the
-# Colab session disconnects (idle timeout, 12h cap, GPU reclaim), which
-# would silently erase every checkpoint. Mount Drive first:
-#   from google.colab import drive; drive.mount('/content/drive')
-ADAPTER_OUT_DIR = Path("/content/drive/MyDrive/qwen2vl_lora_adapter")
-VAL_SPLIT_CSV = Path("/content/drive/MyDrive/lora_val_split.csv")
+ADAPTER_OUT_DIR = Path(os.environ.get("SNU_ADAPTER_DIR", "/workspace/qwen2vl_lora_adapter"))
+VAL_SPLIT_CSV = Path(os.environ.get("SNU_VAL_SPLIT_CSV", "/workspace/lora_val_split.csv"))
+BATCH_SIZE = int(os.environ.get("SNU_BATCH_SIZE", "1"))
 
 MODEL_NAME = "Qwen/Qwen2-VL-2B-Instruct"
 VAL_FRAC = 0.12
 SEED = 42
 N_EPOCHS = 2
 LR = 1e-4
-CHECKPOINT_EVERY_N_ROWS = 500   # save adapter periodically so a 12h session
-                                  # limit never loses more than this much progress
+# ~500 rows worth, matching the old per-row cadence, so a crash/interruption
+# never loses more than this much progress.
+CHECKPOINT_EVERY_N_STEPS = max(1, 500 // BATCH_SIZE)
 
 
 def build_example(row, image_dir):
@@ -95,7 +96,36 @@ def load_model_and_processor():
         )
         model = get_peft_model(base_model, lora_config)
     model.print_trainable_parameters()
+    # Trades compute for memory (recomputes activations in the backward pass
+    # instead of storing them) — needed headroom on a 24GB card at this
+    # task's sequence length (4 images/example, batched).
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
     return model, processor
+
+
+def iter_batches(df, batch_size):
+    """Fixed, non-shuffled chunks — same order every run, so resuming by
+    'skip the first N batches' always skips exactly the same rows."""
+    for start in range(0, len(df), batch_size):
+        yield df.iloc[start:start + batch_size]
+
+
+def build_batch_inputs(processor, batch_df, image_dir):
+    texts, all_images = [], []
+    for _, row in batch_df.iterrows():
+        messages, target_text = build_example(row, image_dir)
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, _ = process_vision_info(messages)
+        texts.append(text + target_text)
+        all_images.extend(image_inputs)   # flat list: every example contributes exactly 4
+
+    inputs = processor(text=texts, images=all_images, return_tensors="pt", padding=True)
+    labels = inputs["input_ids"].clone()
+    labels[inputs["attention_mask"] == 0] = -100   # ignore padding in the loss
+    return inputs, labels
 
 
 def train(model, processor, train_df):
@@ -107,34 +137,28 @@ def train(model, processor, train_df):
     start_step = 0
     if progress_path.exists():
         start_step = json.loads(progress_path.read_text())["step"]
-        print(f"resuming: skipping the first {start_step} rows already trained on")
+        print(f"resuming: skipping the first {start_step} batches already trained on")
 
+    batches_per_epoch = (len(train_df) + BATCH_SIZE - 1) // BATCH_SIZE
     step = 0
     for epoch in range(N_EPOCHS):
-        for _, row in train_df.iterrows():
+        for batch_df in iter_batches(train_df, BATCH_SIZE):
             step += 1
             if step <= start_step:
-                continue   # already trained on this row in a previous session
+                continue   # already trained on this batch in a previous session
 
-            messages, target_text = build_example(row, TRAIN_IMG_DIR)
-            text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, _ = process_vision_info(messages)
-            full_text = text + target_text
-            inputs = processor(
-                text=[full_text], images=image_inputs, return_tensors="pt"
-            ).to(model.device)
+            inputs, labels = build_batch_inputs(processor, batch_df, TRAIN_IMG_DIR)
+            inputs = inputs.to(model.device)
+            labels = labels.to(model.device)
 
-            labels = inputs["input_ids"].clone()
             outputs = model(**inputs, labels=labels)
             outputs.loss.backward()
             optim.step()
             optim.zero_grad()
 
-            if step % 50 == 0:
-                print(f"epoch {epoch} step {step}: loss={outputs.loss.item():.4f}")
-            if step % CHECKPOINT_EVERY_N_ROWS == 0:
+            if step % 10 == 0:
+                print(f"epoch {epoch} step {step}/{batches_per_epoch}: loss={outputs.loss.item():.4f}")
+            if step % CHECKPOINT_EVERY_N_STEPS == 0:
                 model.save_pretrained(ADAPTER_OUT_DIR)
                 progress_path.write_text(json.dumps({"step": step}))
                 print(f"checkpointed adapter at step {step} -> {ADAPTER_OUT_DIR}")

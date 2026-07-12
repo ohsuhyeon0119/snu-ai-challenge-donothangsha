@@ -52,11 +52,14 @@ def generate_prediction(model, processor, row, image_dir):
 def evaluate(model, processor):
     val_df = pd.read_csv(VAL_SPLIT_CSV)
     preds, truths = [], []
-    for _, row in val_df.iterrows():
+    for i, (_, row) in enumerate(val_df.iterrows()):
         pred = generate_prediction(model, processor, row, TRAIN_IMG_DIR)
         truth = tuple(ast.literal_eval(row["Answer"]))
         preds.append(pred)
         truths.append(truth)
+        if (i + 1) % 50 == 0:
+            running_acc = sum(1 for p, t in zip(preds, truths) if p == t) / len(preds)
+            print(f"  eval {i + 1}/{len(val_df)}: running accuracy so far = {running_acc:.4f}")
 
     correct = sum(1 for p, t in zip(preds, truths) if p == t)
     acc = correct / len(truths)
@@ -64,3 +67,16 @@ def evaluate(model, processor):
           f"(compare against Track A's val accuracy from train_classifier.py, "
           f"and the ~0.155 majority-class floor)")
     return acc
+
+
+if __name__ == "__main__":
+    from lora_finetune import load_model_and_processor
+
+    model, processor = load_model_and_processor()
+    # Undo the training-time settings: checkpointing/no-cache only help the
+    # backward pass and actively slow down (or warn-conflict with) generate().
+    model.gradient_checkpointing_disable()
+    model.config.use_cache = True
+    model.eval()
+
+    evaluate(model, processor)
