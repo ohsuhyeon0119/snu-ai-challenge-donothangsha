@@ -28,10 +28,34 @@ Tasks 1-7, 9, 10 were implemented and run end-to-end. Honest outcome:
 temporal/motion signal for a small classifier head to learn generalizable 4-frame exact-order
 prediction — it either shortcuts to the majority class or overfits noise. Track A's real
 deliverables that remain valuable regardless are the validation harness (Task 3) and submission
-generator (Task 10), which Track B reuses unchanged. The actual path to beating the organizer's
-zero-shot baseline is Track B (Task 8, LoRA-finetuning the full Qwen2-VL-2B VLM) — a real
-vision-language model can attend to fine-grained cross-frame differences and caption context in
-a way a pooled CLIP vector cannot. Track B must be run by the user in Colab/Kaggle (no local GPU).
+generator (Task 10), which Track B reuses unchanged.
+
+## Results (Track B, LoRA fine-tune on a rented RTX 3090, 2026-07-12)
+
+Ran `lora_finetune.py` end-to-end on a Vast.ai on-demand RTX 3090 (24GB), then `lora_eval.py`
+against the same 1,145-row held-out validation split methodology as Track A.
+
+- Setup: batch_size=1 (batching OOM'd — see commit message / code comments: Qwen2-VL's ~152k
+  vocab makes the cross-entropy logits tensor scale with batch_size, and batch_size=2 already
+  exceeds 24GB even with gradient checkpointing on), LoRA r=16 on q_proj/v_proj, 4-bit base
+  model, 2 epochs over 8,390 train rows (16,780 steps), ~3.88h wall clock (~0.6-0.8s/step).
+- Known limitation (not fixed before this run, given time already invested — see conversation):
+  loss is computed over the *full* sequence (prompt + images + answer), not masked to just the
+  answer tokens. Diluted signal, not zero signal — the prompt template is largely fixed/easy so
+  the model still gets most of its gradient from the varying (Sentence + answer) parts, but a
+  masked-loss rerun is a natural next improvement if there's time before the deadline.
+- **Result: 0.1677 val accuracy** (1,145/1,145 evaluated), vs. the 0.1546 majority-class floor
+  and Track A's best of 0.1572. A modest, non-dramatic improvement (~+1.3pp) — better than both
+  prior baselines, but the margin is only ~1.2 standard errors at this sample size (SE ≈ 0.011),
+  so it should be read as "real fine-tuning happened and it helped a little," not "solved."
+
+**Overall conclusion across both tracks:** the zero-shot-vs-fine-tuned gap on this task is
+smaller than hoped from a single un-tuned LoRA pass. The clearest remaining lever is fixing the
+prompt-masking gap above; other candidates (LR schedule/warmup, more epochs with early stopping
+on val accuracy, r=32 LoRA) are untested. `outputs/classifier.pt` (Track A) and the Vast.ai
+instance's `/workspace/qwen2vl_lora_adapter` (Track B, not yet pulled to this repo) are both
+weak-but-real artifacts — Track B is the better of the two and the one to submit from if no
+further iteration happens before the deadline.
 
 `outputs/classifier.pt` and `outputs/submission.csv` reflect the seed=2 augmented run (0.1572)
 as the best reproducible artifact, but should be treated as a placeholder no better than the
