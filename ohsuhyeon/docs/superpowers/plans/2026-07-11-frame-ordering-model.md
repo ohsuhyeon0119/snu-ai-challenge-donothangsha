@@ -8,6 +8,35 @@
 
 **Tech Stack:** Python 3.11, PyTorch, `transformers` (CLIPModel, Qwen2VLForConditionalGeneration), `peft` (LoRA), `pandas`, `Pillow`, `scikit-learn` (stratified split), `numpy`.
 
+## Results (Track A, run locally on M5 Mac, 2026-07-12)
+
+Tasks 1-7, 9, 10 were implemented and run end-to-end. Honest outcome:
+
+- Majority-class baseline (always predict `[1,2,3,4]`): **0.1546** val accuracy.
+- CLIP-features + Transformer head, **no augmentation**: caps at exactly **0.1546** — the model
+  just learns to always predict the majority class and never beats it; pushed harder (more
+  epochs / class-weighted loss) it overfits *past* the majority-class shortcut and drops well
+  *below* the floor (train accuracy climbs to 30%+ while val accuracy falls toward random,
+  1/24 ≈ 0.042). Confirmed via a train-vs-val diagnostic — this is overfitting on weak signal,
+  not a training-stability bug.
+- CLIP-features + Transformer head, **with permutation-expansion augmentation** (Task 7): across
+  3 fixed random seeds, best val accuracy was **0.1537, 0.1528, 0.1572** — statistically tied
+  with the majority-class floor, not a reliable improvement. (An earlier unseeded run hit 0.186
+  by luck; it did not reproduce across seeds and should not be read as the model's real ceiling.)
+
+**Conclusion:** a frozen CLIP global image embedding does not carry enough fine-grained
+temporal/motion signal for a small classifier head to learn generalizable 4-frame exact-order
+prediction — it either shortcuts to the majority class or overfits noise. Track A's real
+deliverables that remain valuable regardless are the validation harness (Task 3) and submission
+generator (Task 10), which Track B reuses unchanged. The actual path to beating the organizer's
+zero-shot baseline is Track B (Task 8, LoRA-finetuning the full Qwen2-VL-2B VLM) — a real
+vision-language model can attend to fine-grained cross-frame differences and caption context in
+a way a pooled CLIP vector cannot. Track B must be run by the user in Colab/Kaggle (no local GPU).
+
+`outputs/classifier.pt` and `outputs/submission.csv` reflect the seed=2 augmented run (0.1572)
+as the best reproducible artifact, but should be treated as a placeholder no better than the
+naive baseline until Track B produces something to compare against.
+
 ## Global Constraints
 
 - Final inference must run fully offline, on a single NVIDIA RTX 3090 (24GB VRAM), CPU AMD EPYC 7502, 512GB RAM — no internet at inference time.
