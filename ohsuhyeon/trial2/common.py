@@ -149,6 +149,27 @@ def score_orders(model, processor, messages, chunk=SCORE_CHUNK):
     return ALL_ORDERS[best]
 
 
+_ORDER_RE = __import__("re").compile(r"\[([1-4])\s*,\s*([1-4])\s*,\s*([1-4])\s*,\s*([1-4])\]")
+
+
+@torch.no_grad()
+def generate_order(model, processor, messages, max_new_tokens=24):
+    """Fast greedy-generation prediction (for the in-training monitor on big
+    models, where 24-way constrained scoring is too slow). Falls back to
+    identity on any malformed / non-permutation output."""
+    prompt_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _ = process_vision_info(messages)
+    inputs = processor(text=[prompt_text], images=image_inputs, return_tensors="pt").to(model.device)
+    out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    text = processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
+    m = _ORDER_RE.search(text)
+    if m:
+        io = [int(m.group(i)) for i in range(1, 5)]
+        if sorted(io) == [1, 2, 3, 4]:
+            return io
+    return [1, 2, 3, 4]
+
+
 def exact_match(preds_answer, truths_answer):
     correct = sum(1 for p, t in zip(preds_answer, truths_answer) if list(p) == list(t))
     return correct / max(1, len(truths_answer))
