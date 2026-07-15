@@ -11,15 +11,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", required=True, help="Directory containing sample_submission.csv")
     parser.add_argument("--submission", required=True, help="Submission CSV to validate")
+    parser.add_argument(
+        "--allow-empty-answer",
+        action="store_true",
+        help="Allow blank Answer cells; useful only for checking sample_submission.csv structure",
+    )
     args = parser.parse_args()
 
     sample_path = Path(args.data_dir) / "sample_submission.csv"
-    errors = validate_submission(sample_path, args.submission)
-    if errors:
-        print("INVALID")
-        for error in errors:
-            print(f"- {error}")
-        raise SystemExit(1)
+    validate_submission(
+        sample_path,
+        args.submission,
+        allow_empty_answer=args.allow_empty_answer,
+    )
     print("VALID")
 
 

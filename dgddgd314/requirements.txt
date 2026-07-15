@@ -1,4 +1,8 @@
 pandas
 pillow
 tqdm
-
+torch
+transformers
+peft
+accelerate
+bitsandbytes

@@ -9,10 +9,12 @@ Current direction:
 - Local machine work should focus on data audit, validation, packaging, and remote GPU run orchestration. Training/inference speed and VRAM checks need a CUDA box.
 
 Key docs:
-- [docs/PLAN.md]
-- [docs/REMOTE_GPU_RUNBOOK.md]
+- [PALIGEMMA_PLAN.md]
+- [IMAGE_PROCESSING.md]
+- [REMOTE_GPU_RUNBOOK.md]
 
 Utility scripts:
 - `python scripts/validate_submission.py --data-dir <data_dir> --submission <csv>`
 - `python scripts/audit_data.py --data-dir <data_dir> --out outputs/data_audit.csv`
-
+- `python scripts/paligemma_make_sheet.py --out outputs/sheet.jpg <img1> <img2> <img3> <img4>`
+- `python scripts/paligemma_smoke.py --no-load-model`
