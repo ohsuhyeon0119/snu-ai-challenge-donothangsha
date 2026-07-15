@@ -1,0 +1,15 @@
+# python venv
+venv/
+__pycache__/
+*.py[cod]
+
+# docs
+docs/
+
+# local outputs and competition artifacts
+outputs/
+data/
+*.pt
+*.pth
+*.safetensors
+*.bin
