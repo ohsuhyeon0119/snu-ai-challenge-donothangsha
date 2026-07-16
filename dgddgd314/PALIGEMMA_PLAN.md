@@ -2,7 +2,7 @@
 
 ## 결론
 
-PaliGemma로 가려면 plain Gemma 7B 대신 **PaliGemma/PaliGemma 2 같은 VLM**을 사용한다. 이 대회는 이미지 4장과 문장을 함께 봐야 하므로 텍스트 전용 Gemma보다 PaliGemma가 문제 구조에 맞다.
+**PaliGemma/PaliGemma 2 같은 VLM**을 사용한다. 이 대회는 이미지 4장과 문장을 함께 봐야 하므로 텍스트 전용 Gemma보다 PaliGemma가 문제 구조에 맞다.
 
 다만 PaliGemma는 보통 `image + text -> text` 형태의 단일 이미지 입력 모델로 쓰인다. 따라서 4개 프레임을 각각 따로 넣는 대신, `Input_1`~`Input_4`를 라벨이 박힌 2x2 contact sheet 한 장으로 합쳐서 입력한다.
 

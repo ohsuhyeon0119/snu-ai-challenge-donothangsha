@@ -4,12 +4,18 @@ __pycache__/
 *.py[cod]
 
 # docs
-docs/
+docs/*
+!docs/VAST_LOCAL_MODEL_UPLOAD.md
 
 # local outputs and competition artifacts
 outputs/
 data/
+snu_data.tar
+local_models/
+models/
+*.tar
 *.pt
 *.pth
 *.safetensors
 *.bin
+.env
