@@ -62,11 +62,16 @@ def main():
     print(f"[3/4] KV-cache scorer == reference: OK  "
           f"(vram peak {torch.cuda.max_memory_allocated() / 2**30:.1f}GB)")
 
-    # --- one masked training step ---
+    # --- one masked training step (same prep path as train.py) ---
     from peft import LoraConfig, get_peft_model
+    from common import QUANT
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    if QUANT:
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model)
+    else:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
     model = get_peft_model(model, LoraConfig(
         r=8, lora_alpha=16, task_type="CAUSAL_LM",
         target_modules=lora_target_modules(model)))

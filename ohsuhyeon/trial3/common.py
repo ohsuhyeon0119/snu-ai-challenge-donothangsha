@@ -131,10 +131,16 @@ def load_model(device_map="cuda:0"):
               device_map=device_map)
     if QUANT == "nf4":
         from transformers import BitsAndBytesConfig
+        # keep the vision tower in bf16: vision encoders are the most
+        # quantization-sensitive part and cost only ~1GB extra
+        skip = ["lm_head"]
+        if os.environ.get("SNU_SKIP_VISION_QUANT", "1") == "1":
+            skip.append("visual")
         kw["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_quant_type="nf4",
             bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16)
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            llm_int8_skip_modules=skip)
     return AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kw)
 
 
