@@ -1,0 +1,4 @@
+data_work/
+outputs/
+ckpts/
+__pycache__/
