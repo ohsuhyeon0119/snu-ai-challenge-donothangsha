@@ -1,0 +1,25 @@
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Competition data must remain outside version control
+data/
+snuaichallenge_data/
+*.zip
+
+# Generated artifacts
+outputs/
+cache/
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Local experiment records (schema/docs may still be tracked)
+experiments/*.jsonl
