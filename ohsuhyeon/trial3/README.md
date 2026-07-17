@@ -41,6 +41,11 @@ SNU_ADAPTER_DIR=ckpt SNU_TTA_K=3 python infer.py   # → outputs/trial3_submissi
 
 Validation readout: `SNU_SPLIT=val SNU_ADAPTER_DIR=ckpts/best python infer.py`
 
+**Before the final submission**: the in-training monitor is greedy-decode (a
+fast proxy); the deployed decision rule is 24-way scoring + TTA. Re-rank the
+top 2-3 checkpoints with the real rule on a val subset and submit the winner:
+`SNU_SPLIT=val SNU_LIMIT=300 SNU_TTA_K=3 SNU_ADAPTER_DIR=ckpts/ckpt-N python infer.py`
+
 ## Env knobs
 
 `SNU_MODEL` (default Qwen/Qwen3-VL-8B-Instruct) · `SNU_DATA_DIR` ·

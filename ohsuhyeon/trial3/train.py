@@ -34,8 +34,9 @@ from common import (SIGMAS, TRAIN_IMG_DIR, build_messages,
                     image_order_from_answer, load_model, load_processor,
                     lora_target_modules, slot_order, target_text)
 
-TRAIN_CSV = Path(os.environ.get("SNU_TRAIN_CSV", "data_work/train_clean.csv"))
-VAL_CSV = Path(os.environ.get("SNU_VAL_CSV", "data_work/clean_val.csv"))
+WORK_DIR = os.environ.get("SNU_WORK_DIR", "data_work")
+TRAIN_CSV = Path(os.environ.get("SNU_TRAIN_CSV", f"{WORK_DIR}/train_clean.csv"))
+VAL_CSV = Path(os.environ.get("SNU_VAL_CSV", f"{WORK_DIR}/clean_val.csv"))
 CKPT_DIR = Path(os.environ.get("SNU_CKPT_DIR", "ckpts"))
 MB = int(os.environ.get("SNU_MB", "8"))
 ACCUM = int(os.environ.get("SNU_ACCUM", "2"))
@@ -48,10 +49,16 @@ SEED = int(os.environ.get("SNU_SEED", "42"))
 WARMUP_FRAC = 0.03
 
 
+SHUFFLE_EPOCH0 = os.environ.get("SNU_SHUFFLE_EPOCH0", "1") == "1"
+
+
 def sigma_for(sample_id, epoch):
-    """Deterministic per-(sample, epoch) presentation order. Epoch 0 keeps the
-    identity so early training matches the canonical layout."""
-    if epoch == 0:
+    """Deterministic per-(sample, epoch) presentation order.
+
+    Default: shuffle every epoch (incl. 0) — training then matches the
+    inference-time TTA decision rule, which scores under shuffled sigmas.
+    Set SNU_SHUFFLE_EPOCH0=0 to keep epoch 0 canonical (identity) instead."""
+    if epoch == 0 and not SHUFFLE_EPOCH0:
         return SIGMAS[0]
     h = hashlib.sha1(f"{SEED}:{epoch}:{sample_id}".encode()).digest()
     return SIGMAS[h[0] % len(SIGMAS)]
@@ -225,8 +232,7 @@ def main():
         ds.epoch = epoch
         gen = torch.Generator().manual_seed(SEED + epoch)
         dl = DataLoader(ds, batch_size=MB, shuffle=True, generator=gen,
-                        num_workers=8, collate_fn=collate, drop_last=False,
-                        persistent_workers=True)
+                        num_workers=8, collate_fn=collate, drop_last=False)
         it = iter(dl)
         in_epoch = 0
         # fast-forward after resume (same generator -> same order)
@@ -245,6 +251,11 @@ def main():
                     break
                 batch = {k: v.to(model.device) for k, v in batch.items()}
                 out = model(**batch)
+                if not torch.isfinite(out.loss):
+                    raise RuntimeError(
+                        f"non-finite loss at step {step} - aborting so the "
+                        f"box doesn't burn money; resume from last ckpt with "
+                        f"a lower SNU_LR")
                 (out.loss / ACCUM).backward()
                 loss_sum += out.loss.item()
                 got += 1
