@@ -202,9 +202,13 @@ def score_completions(model, processor, messages, completions):
             s = first_lp[ids[0]].item()
             if L > 1:
                 t = torch.tensor([ids], device=model.device)
-                attn = torch.ones((1, plen + L - 1), dtype=torch.long,
-                                  device=model.device)
-                o = model(input_ids=t[:, :-1], attention_mask=attn,
+                # NOTE: no attention_mask here on purpose. With a cache
+                # present, Qwen3VL derives mrope positions from the FULL
+                # mask length (past+new) but applies them to the new tokens
+                # only -> shape crash. With mask=None it uses
+                # arange(past, past+new) + rope_deltas, which is correct
+                # (batch=1, no padding, causal attention over full KV).
+                o = model(input_ids=t[:, :-1],
                           past_key_values=cache, use_cache=True,
                           cache_position=torch.arange(
                               plen, plen + L - 1, device=model.device))

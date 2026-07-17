@@ -104,16 +104,23 @@ def make_collate(processor):
         input_ids = torch.full((B, L), pad_id, dtype=torch.long)
         attn = torch.zeros((B, L), dtype=torch.long)
         labels = torch.full((B, L), -100, dtype=torch.long)
+        has_mm = "mm_token_type_ids" in enc[0]  # required by transformers v5
+        mm = torch.zeros((B, L), dtype=torch.long) if has_mm else None
         for b, (e, tl) in enumerate(zip(enc, tlens)):
             n = e["input_ids"].shape[1]
             input_ids[b, :n] = e["input_ids"][0]
             attn[b, :n] = 1
             labels[b, n - tl:n] = e["input_ids"][0, n - tl:]  # completion only
+            if has_mm:
+                mm[b, :n] = e["mm_token_type_ids"][0]  # pad = 0 (text)
         pixel_values = torch.cat([e["pixel_values"] for e in enc], dim=0)
         grid = torch.cat([e["image_grid_thw"] for e in enc], dim=0)
-        return {"input_ids": input_ids, "attention_mask": attn,
-                "labels": labels, "pixel_values": pixel_values,
-                "image_grid_thw": grid}
+        batch = {"input_ids": input_ids, "attention_mask": attn,
+                 "labels": labels, "pixel_values": pixel_values,
+                 "image_grid_thw": grid}
+        if has_mm:
+            batch["mm_token_type_ids"] = mm
+        return batch
 
     return collate
 
