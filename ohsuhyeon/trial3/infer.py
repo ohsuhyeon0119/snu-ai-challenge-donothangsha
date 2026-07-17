@@ -52,9 +52,11 @@ def main():
     model = load_model()
     if ADAPTER_DIR:
         from peft import PeftModel
+        from common import QUANT
         model = PeftModel.from_pretrained(model, ADAPTER_DIR)
-        model = model.merge_and_unload()   # bake LoRA in -> full-speed bf16
-        print(f"merged adapter: {ADAPTER_DIR}")
+        if not QUANT:
+            model = model.merge_and_unload()  # bake LoRA in (bf16 only)
+        print(f"adapter loaded: {ADAPTER_DIR} (merged={not QUANT})")
     model.eval()
 
     done = {}

@@ -181,11 +181,17 @@ def main():
     print(f"train={len(df)} val={len(val_rows)} mb={MB} accum={ACCUM} "
           f"epochs={EPOCHS} lora_r={LORA_R}")
 
+    from common import QUANT
     processor = load_processor()
     model = load_model()
     model.config.use_cache = False
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    if QUANT:
+        # QLoRA: casts norms/lm_head, enables grad ckpt + input grads
+        from peft import prepare_model_for_kbit_training
+        model = prepare_model_for_kbit_training(model)
+    else:
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
 
     from peft import LoraConfig, get_peft_model
     lcfg = LoraConfig(r=LORA_R, lora_alpha=2 * LORA_R, lora_dropout=0.05,

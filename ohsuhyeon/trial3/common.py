@@ -21,7 +21,10 @@ import os
 from itertools import permutations
 from pathlib import Path
 
-MODEL_NAME = os.environ.get("SNU_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+MODEL_NAME = os.environ.get("SNU_MODEL", "Qwen/Qwen3-VL-32B-Instruct")
+# "" = bf16 (8B fits a 3090 unquantized); "nf4" = 4-bit QLoRA path (32B).
+# Train and inference MUST use the same value -> precision-consistent.
+QUANT = os.environ.get("SNU_QUANT", "nf4")
 DATA_DIR = Path(os.environ.get("SNU_DATA_DIR", "data"))
 TRAIN_IMG_DIR = DATA_DIR / "train"
 TEST_IMG_DIR = DATA_DIR / "test"
@@ -124,23 +127,30 @@ def load_processor():
 def load_model(device_map="cuda:0"):
     import torch
     from transformers import AutoModelForImageTextToText
-    return AutoModelForImageTextToText.from_pretrained(
-        MODEL_NAME, torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa", device_map=device_map)
+    kw = dict(dtype=torch.bfloat16, attn_implementation="sdpa",
+              device_map=device_map)
+    if QUANT == "nf4":
+        from transformers import BitsAndBytesConfig
+        kw["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16)
+    return AutoModelForImageTextToText.from_pretrained(MODEL_NAME, **kw)
 
 
 def lora_target_modules(model):
-    """Exact names of LLM-decoder linear layers (vision tower excluded)."""
-    import torch
+    """Exact names of LLM-decoder linear layers (vision tower excluded).
+    Matches by class name so bnb Linear4bit (QLoRA) is included too."""
     keep = {"q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj"}
     names = []
     for name, m in model.named_modules():
-        if not isinstance(m, torch.nn.Linear):
-            continue
         if name.rsplit(".", 1)[-1] not in keep:
             continue
         if "visual" in name or "vision" in name:
+            continue
+        if not m.__class__.__name__.endswith(
+                ("Linear", "Linear4bit", "Linear8bitLt")):
             continue
         names.append(name)
     assert names, "no LoRA target modules found - model layout changed?"

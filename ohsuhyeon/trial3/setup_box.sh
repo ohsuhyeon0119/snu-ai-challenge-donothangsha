@@ -4,12 +4,12 @@
 set -euo pipefail
 
 pip install -q -U "transformers>=4.57.0" "peft>=0.13" accelerate \
-    "qwen-vl-utils>=0.0.14" pandas pillow numpy safetensors
+    "qwen-vl-utils>=0.0.14" bitsandbytes pandas pillow numpy safetensors
 
 python - <<'EOF'
 from huggingface_hub import snapshot_download
 import os
-m = os.environ.get("SNU_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+m = os.environ.get("SNU_MODEL", "Qwen/Qwen3-VL-32B-Instruct")
 print("downloading", m)
 snapshot_download(m)
 print("done")
