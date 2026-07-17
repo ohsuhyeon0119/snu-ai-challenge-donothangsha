@@ -124,7 +124,7 @@ def extract_multimodal_hidden_state(backbone: Any, inputs: dict[str, Any]) -> An
     attention_mask = inputs.get("attention_mask")
     image_grid_thw = inputs.get("image_grid_thw")
     video_grid_thw = inputs.get("video_grid_thw")
-    inputs_embeds = core.model.embed_tokens(input_ids)
+    inputs_embeds = core.get_input_embeddings()(input_ids)
 
     def insert_visual_tokens(pixel_key: str, grid: Any, token_id: int) -> None:
         nonlocal inputs_embeds
@@ -152,7 +152,7 @@ def extract_multimodal_hidden_state(backbone: Any, inputs: dict[str, Any]) -> An
     position_ids, _ = core.get_rope_index(
         input_ids, image_grid_thw, video_grid_thw, attention_mask
     )
-    outputs = core.model(
+    outputs = core(
         input_ids=None,
         inputs_embeds=inputs_embeds,
         attention_mask=attention_mask,

@@ -1,10 +1,14 @@
+import inspect
 from pathlib import Path
 
 from snu_ordering.candidate1.artifacts import ArtifactLayout
 from snu_ordering.candidate1.config import Candidate1Config
 from snu_ordering.candidate1.data import build_messages, validate_image_grid_count
 from snu_ordering.candidate1.inference import class_ids_to_answers
-from snu_ordering.candidate1.model import validate_trainable_parameters
+from snu_ordering.candidate1.model import (
+    extract_multimodal_hidden_state,
+    validate_trainable_parameters,
+)
 
 
 def test_candidate1_defaults_lock_the_reference_design():
@@ -99,6 +103,14 @@ def test_trainability_guard_accepts_only_lora_and_classifier_parameters():
             )
 
     validate_trainable_parameters(Model())
+
+
+def test_hidden_state_extraction_uses_qwen2vl_model_public_interface():
+    source = inspect.getsource(extract_multimodal_hidden_state)
+
+    assert "core.get_input_embeddings()(input_ids)" in source
+    assert "outputs = core(" in source
+    assert "core.model" not in source
 
 
 def test_artifact_layout_is_compact_and_inspectable(tmp_path):
