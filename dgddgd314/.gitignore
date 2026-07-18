@@ -9,6 +9,7 @@ docs/*
 
 # local outputs and competition artifacts
 outputs/
+paligemma_run_20000_outputs.tar.gz
 data/
 snu_data.tar
 local_models/
