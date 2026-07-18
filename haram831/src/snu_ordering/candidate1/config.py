@@ -1,4 +1,4 @@
-"""Configuration for Candidate Model 1: Qwen2-VL + QLoRA + 24-class head."""
+"""Configuration for Candidate Model 1 v3: Qwen2-VL answer generation."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-ARCHITECTURE_VERSION = "candidate1_classifier_v2"
+ARCHITECTURE_VERSION = "candidate1_causal_lm_v3"
 LEGACY_ARCHITECTURE_VERSION = "candidate1_classifier_v1"
 
 
@@ -16,8 +16,6 @@ LEGACY_ARCHITECTURE_VERSION = "candidate1_classifier_v1"
 class ModelConfig:
     base_model_path: str = "Qwen/Qwen2-VL-2B-Instruct"
     processor_path: str | None = None
-    num_classes: int = 24
-    classifier_dropout: float = 0.0
     min_pixels: int = 128 * 28 * 28
     max_pixels: int = 256 * 28 * 28
     trust_remote_code: bool = False
@@ -33,31 +31,40 @@ class QuantizationConfig:
 
 @dataclass(frozen=True)
 class LoraSettings:
-    rank: int = 16
-    alpha: int = 32
+    rank: int = 32
+    alpha: int = 64
     dropout: float = 0.05
-    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
+    target_modules: tuple[str, ...] = (
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    )
 
 
 @dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
-    epochs: int = 8
+    epochs: int = 3
     max_steps: int | None = None
     batch_size: int = 1
     gradient_accumulation_steps: int = 8
-    learning_rate: float = 2e-4
-    classifier_learning_rate: float = 1e-3
-    warmup_ratio: float = 0.05
-    class_weight_power: float = 0.5
+    learning_rate: float = 1e-4
+    warmup_ratio: float = 0.03
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
-    validation_fraction: float = 0.15
-    fast_validation_size: int = 256
-    full_validation_every_epochs: int = 2
+    validation_fraction: float = 0.12
+    fast_validation_every_steps: int = 400
+    fast_validation_size: int = 120
+    constrained_validation_size: int = 160
+    scoring_chunk_size: int = 12
+    generation_max_new_tokens: int = 32
     collapse_threshold: float = 0.5
     success_accuracy: float = 0.25
-    log_every_steps: int = 10
+    log_every_steps: int = 20
     save_every_steps: int = 100
     gradient_checkpointing: bool = True
     tiny_subset_size: int = 16
@@ -74,22 +81,28 @@ class Candidate1Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     def __post_init__(self) -> None:
-        if self.model.num_classes != 24:
-            raise ValueError("Candidate Model 1 must use the canonical 24 classes")
+        if self.architecture_version != ARCHITECTURE_VERSION:
+            raise ValueError(
+                "Candidate1 config architecture is incompatible with causal-LM v3: "
+                f"{self.architecture_version!r}"
+            )
         if not self.lora.target_modules:
             raise ValueError("At least one LoRA target module is required")
-        if self.training.tiny_subset_size < 1:
-            raise ValueError("tiny_subset_size must be positive")
-        if self.training.classifier_learning_rate <= 0 or self.training.learning_rate <= 0:
-            raise ValueError("Learning rates must be positive")
+        if self.training.epochs < 1 or self.training.tiny_subset_size < 1:
+            raise ValueError("Epoch and subset sizes must be positive")
+        if self.training.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive")
         if not 0.0 <= self.training.warmup_ratio < 1.0:
             raise ValueError("warmup_ratio must be in [0, 1)")
-        if not 0.0 <= self.training.class_weight_power <= 1.0:
-            raise ValueError("class_weight_power must be in [0, 1]")
-        if self.training.fast_validation_size < 1:
-            raise ValueError("fast_validation_size must be positive")
-        if self.training.full_validation_every_epochs < 1:
-            raise ValueError("full_validation_every_epochs must be positive")
+        for name in (
+            "fast_validation_every_steps",
+            "fast_validation_size",
+            "constrained_validation_size",
+            "scoring_chunk_size",
+            "generation_max_new_tokens",
+        ):
+            if getattr(self.training, name) < 1:
+                raise ValueError(f"{name} must be positive")
         if not 0.0 < self.training.collapse_threshold <= 1.0:
             raise ValueError("collapse_threshold must be in (0, 1]")
         if not 0.0 < self.training.success_accuracy <= 1.0:
@@ -106,13 +119,17 @@ class Candidate1Config:
     @classmethod
     def load(cls, path: str | Path) -> "Candidate1Config":
         raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        version = raw.get("architecture_version", LEGACY_ARCHITECTURE_VERSION)
+        if version != ARCHITECTURE_VERSION:
+            raise ValueError(
+                "Candidate1 config architecture is incompatible with causal-LM v3: "
+                f"{version!r}; start a fresh v3 run"
+            )
         lora = dict(raw.get("lora", {}))
         if "target_modules" in lora:
             lora["target_modules"] = tuple(lora["target_modules"])
         return cls(
-            architecture_version=raw.get(
-                "architecture_version", LEGACY_ARCHITECTURE_VERSION
-            ),
+            architecture_version=version,
             model=ModelConfig(**raw.get("model", {})),
             quantization=QuantizationConfig(**raw.get("quantization", {})),
             lora=LoraSettings(**lora),

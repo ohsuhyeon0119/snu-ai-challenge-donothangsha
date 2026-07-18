@@ -1,4 +1,4 @@
-"""Candidate Model 1 reference pipeline (Qwen2-VL-2B + QLoRA classifier)."""
+"""Candidate Model 1 v3: completion-only Qwen2-VL QLoRA."""
 
 from .config import Candidate1Config
 

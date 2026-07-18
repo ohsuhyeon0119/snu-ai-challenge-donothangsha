@@ -1,4 +1,4 @@
-"""Four-image prompt construction and processor collation."""
+"""Four-image prompts and completion-only causal-LM batches."""
 
 from __future__ import annotations
 
@@ -9,16 +9,15 @@ from typing import Any
 from PIL import Image
 
 from ..dataset import INPUT_COLUMNS, resolve_image_paths
+from ..permutation import answer_to_chronological_order, validate_permutation
 
 INSTRUCTION = (
-    "Caption:\n{sentence}\n\n"
-    "The four frames above are Input_1 through Input_4 in shuffled order. "
-    "Use the complete caption and all four frames to identify their original temporal positions. "
-    "Return [p1, p2, p3, p4], where pi is the original temporal position of Input_i. "
-    "For example, [1, 4, 2, 3] means Input_1 is first, Input_2 is fourth, "
-    "Input_3 is second, and Input_4 is third. If the frames are already chronological, "
-    "return [1, 2, 3, 4]."
+    'Caption: "{sentence}"\n\n'
+    "The caption describes events in chronological order. The four images above "
+    "are shuffled frames from that sequence. Return the image numbers from earliest "
+    "to latest as a list such as [3, 1, 4, 2]."
 )
+COMPLETION_TEMPLATE = "The correct chronological order is {order}."
 
 
 def build_messages(
@@ -40,30 +39,40 @@ def build_messages(
                 "max_pixels": max_pixels,
             }
         )
-        content.append({"type": "text", "text": f"Frame {column} (input position {index})."})
+        content.append({"type": "text", "text": f"Image {index}"})
     content.append(
         {"type": "text", "text": INSTRUCTION.format(sentence=str(row["Sentence"]))}
     )
     return [{"role": "user", "content": content}]
 
 
+def render_chat_prompt(processor: Any, messages: list[dict[str, Any]]) -> str:
+    return processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+
+def chronological_order_for_row(row: Mapping[str, Any]) -> tuple[int, int, int, int]:
+    if "answer_tuple" not in row:
+        raise ValueError("Training row is missing answer_tuple")
+    return answer_to_chronological_order(row["answer_tuple"])
+
+
+def target_text(order: Sequence[int]) -> str:
+    validated = validate_permutation(order, name="chronological image order")
+    rendered = "[" + ", ".join(str(value) for value in validated) + "]"
+    return COMPLETION_TEMPLATE.format(order=rendered)
+
+
 def validate_image_grid_count(image_grid_thw: Any, *, batch_size: int) -> None:
-    """Reject processor batches that do not contain four images per sample."""
     expected = 4 * batch_size
     actual = int(image_grid_thw.shape[0])
     if actual != expected:
         raise ValueError(
-            f"Candidate Model 1 requires exactly four images per sample; "
+            "Candidate Model 1 requires exactly four images per sample; "
             f"processor returned {actual} image grids for batch size {batch_size} "
             f"(expected {expected})"
         )
-
-
-def render_chat_prompt(processor: Any, messages: list[dict[str, Any]]) -> str:
-    """Render the state from which Qwen would generate its ordering answer."""
-    return processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
 
 
 def collate_rows(
@@ -75,34 +84,54 @@ def collate_rows(
     max_pixels: int,
     include_labels: bool,
 ) -> dict[str, Any]:
-    """Convert rows into one padded Qwen2-VL processor batch.
-
-    ``qwen_vl_utils`` is imported lazily so metadata/config commands remain usable
-    on CPU-only machines where the training stack is not installed.
-    """
+    """Build a right-padded multimodal batch with prompt tokens masked from loss."""
+    import torch
     from qwen_vl_utils import process_vision_info
 
-    texts: list[str] = []
+    full_texts: list[str] = []
+    prompt_texts: list[str] = []
     images: list[Any] = []
     for row in rows:
         messages = build_messages(
             row, image_root, min_pixels=min_pixels, max_pixels=max_pixels
         )
-        texts.append(render_chat_prompt(processor, messages))
+        prompt = render_chat_prompt(processor, messages)
+        prompt_texts.append(prompt)
+        completion = ""
+        if include_labels:
+            completion = target_text(chronological_order_for_row(row))
+            completion += processor.tokenizer.eos_token
+        full_texts.append(prompt + completion)
         image_inputs, _ = process_vision_info(messages)
         images.extend(image_inputs)
 
-    batch = processor(text=texts, images=images, padding=True, return_tensors="pt")
+    previous_padding_side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "right"
+    try:
+        batch = processor(
+            text=full_texts, images=images, padding=True, return_tensors="pt"
+        )
+        if include_labels:
+            prompt_batch = processor(
+                text=prompt_texts, images=images, padding=True, return_tensors="pt"
+            )
+    finally:
+        processor.tokenizer.padding_side = previous_padding_side
+
     validate_image_grid_count(batch["image_grid_thw"], batch_size=len(rows))
     if include_labels:
-        import torch
-
-        batch["labels"] = torch.tensor([int(row["class_id"]) for row in rows], dtype=torch.long)
+        labels = batch["input_ids"].clone()
+        for index in range(len(rows)):
+            prompt_length = int(prompt_batch["attention_mask"][index].sum().item())
+            labels[index, :prompt_length] = -100
+        labels[batch["attention_mask"] == 0] = -100
+        if not bool((labels != -100).any(dim=1).all().item()):
+            raise ValueError("Every training sample must supervise completion tokens")
+        batch["labels"] = labels.to(dtype=torch.long)
     return batch
 
 
 def load_rgb_images(row: Mapping[str, Any], image_root: str | Path) -> list[Image.Image]:
-    """Load detached RGB copies; useful for integrity/debug tooling."""
     opened: list[Image.Image] = []
     for path in resolve_image_paths(row, image_root):
         with Image.open(path) as image:

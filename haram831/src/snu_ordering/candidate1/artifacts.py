@@ -24,10 +24,6 @@ class ArtifactLayout:
         return self.root / "run_config.json"
 
     @property
-    def classifier_head_path(self) -> Path:
-        return self.root / "classifier_head.pt"
-
-    @property
     def metrics_path(self) -> Path:
         return self.root / "training_metrics.json"
 

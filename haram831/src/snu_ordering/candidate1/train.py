@@ -1,4 +1,4 @@
-"""Training and tiny-subset overfit runner for Candidate Model 1."""
+"""Train Candidate 1 v3 with completion-only QLoRA supervision."""
 
 from __future__ import annotations
 
@@ -7,95 +7,77 @@ import contextlib
 import json
 import math
 import random
+import signal
 import sys
+import time
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import replace
-from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
 from ..dataset import load_metadata
 from ..metrics import exact_match_accuracy, pairwise_accuracy
-from ..permutation import class_id_to_answer
+from ..permutation import answer_to_class_id, class_id_to_answer
 from .artifacts import ArtifactLayout, write_json
 from .config import Candidate1Config
 
 
 class TeeStream:
-    """Mirror writes to the original stream and an append-only log file."""
-
     def __init__(self, *streams: Any):
-        self._streams = streams
+        self.streams = streams
 
     def write(self, value: str) -> int:
-        for stream in self._streams:
+        for stream in self.streams:
             stream.write(value)
             stream.flush()
         return len(value)
 
     def flush(self) -> None:
-        for stream in self._streams:
+        for stream in self.streams:
             stream.flush()
 
 
-def deterministic_split(rows: list[dict[str, Any]], validation_fraction: float, seed: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Make one reproducible split without reading or deriving from test data."""
+def stratified_split(
+    rows: list[dict[str, Any]], validation_fraction: float, seed: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Create a deterministic Answer-stratified split without extra dependencies."""
     if not rows:
         raise ValueError("Training CSV contains no rows")
-    indices = list(range(len(rows)))
-    random.Random(seed).shuffle(indices)
-    validation_size = 0 if len(rows) == 1 else max(1, round(len(rows) * validation_fraction))
-    validation_indices = set(indices[:validation_size])
-    train_rows = [row for index, row in enumerate(rows) if index not in validation_indices]
-    validation_rows = [row for index, row in enumerate(rows) if index in validation_indices]
+    groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[int(row["class_id"])].append(row)
+    train_rows: list[dict[str, Any]] = []
+    validation_rows: list[dict[str, Any]] = []
+    for class_id in sorted(groups):
+        group = list(groups[class_id])
+        random.Random(seed + class_id).shuffle(group)
+        validation_size = max(1, round(len(group) * validation_fraction))
+        validation_rows.extend(group[:validation_size])
+        train_rows.extend(group[validation_size:])
+    random.Random(seed).shuffle(train_rows)
+    random.Random(seed + 1).shuffle(validation_rows)
     return train_rows, validation_rows
-
-
-def _move_batch(batch: dict[str, Any], device: Any) -> dict[str, Any]:
-    return {key: value.to(device) for key, value in batch.items()}
-
-
-def compute_class_weights(
-    rows: list[dict[str, Any]], num_classes: int, power: float
-) -> list[float]:
-    """Return normalized inverse-frequency weights derived from train rows only."""
-    if not rows:
-        raise ValueError("Cannot compute class weights from an empty training split")
-    counts = Counter(int(row["class_id"]) for row in rows)
-    invalid = sorted(value for value in counts if not 0 <= value < num_classes)
-    if invalid:
-        raise ValueError(f"Training rows contain invalid class IDs: {invalid}")
-    raw = [
-        (len(rows) / (num_classes * counts[class_id])) ** power
-        if counts[class_id]
-        else 0.0
-        for class_id in range(num_classes)
-    ]
-    positive = [value for value in raw if value > 0.0]
-    scale = sum(positive) / len(positive)
-    return [value / scale if value > 0.0 else 0.0 for value in raw]
 
 
 def summarize_predictions(
     true_classes: list[int],
     predicted_classes: list[int],
     *,
-    num_classes: int,
     collapse_threshold: float,
+    invalid_generations: int = 0,
+    entropies: list[float] | None = None,
+    margins: list[float] | None = None,
 ) -> dict[str, Any]:
-    """Produce JSON-safe accuracy and class-collapse diagnostics."""
-    if len(true_classes) != len(predicted_classes):
-        raise ValueError("Truth and prediction class lists must have the same length")
-    if not true_classes:
-        raise ValueError("Cannot summarize an empty evaluation split")
-    truth = [class_id_to_answer(int(value)) for value in true_classes]
-    predictions = [class_id_to_answer(int(value)) for value in predicted_classes]
+    if len(true_classes) != len(predicted_classes) or not true_classes:
+        raise ValueError("Prediction and truth lists must be non-empty and equally sized")
+    truth = [class_id_to_answer(value) for value in true_classes]
+    predictions = [class_id_to_answer(value) for value in predicted_classes]
     true_counts = Counter(true_classes)
     predicted_counts = Counter(predicted_classes)
     recalls: dict[str, float | None] = {}
     present_recalls: list[float] = []
-    for class_id in range(num_classes):
+    for class_id in range(24):
         support = true_counts[class_id]
         recall = None
         if support:
@@ -112,59 +94,138 @@ def summarize_predictions(
         "macro_recall": sum(present_recalls) / len(present_recalls),
         "per_class_recall": recalls,
         "predicted_class_histogram": {
-            str(class_id): predicted_counts[class_id]
-            for class_id in range(num_classes)
+            str(class_id): predicted_counts[class_id] for class_id in range(24)
         },
         "max_prediction_share": maximum_share,
         "collapse_detected": maximum_share > collapse_threshold,
+        "invalid_generations": invalid_generations,
+        "candidate_entropy_mean": (
+            sum(entropies) / len(entropies) if entropies else None
+        ),
+        "candidate_margin_mean": sum(margins) / len(margins) if margins else None,
     }
 
 
-def evaluate(
-    model: Any,
-    loader: Any,
-    *,
-    num_classes: int = 24,
-    collapse_threshold: float = 0.5,
-    reporter: Any | None = None,
-) -> dict[str, Any]:
+def _candidate_diagnostics(scores: list[float]) -> tuple[float, float]:
     import torch
 
-    predicted_classes: list[int] = []
+    probabilities = torch.softmax(torch.tensor(scores, dtype=torch.float32), dim=0)
+    entropy = float(-(probabilities * probabilities.clamp_min(1e-12).log()).sum())
+    top = torch.topk(probabilities, 2).values
+    return entropy, float(top[0] - top[1])
+
+
+def evaluate_rows(
+    model: Any,
+    processor: Any,
+    rows: list[dict[str, Any]],
+    image_root: str | Path,
+    config: Candidate1Config,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    import gc
+    import torch
+
+    from .data import build_messages
+    from .scoring import generate_order, order_to_answer, score_order
+
+    if mode not in {"generate", "score"}:
+        raise ValueError(f"Unsupported evaluation mode: {mode}")
     true_classes: list[int] = []
+    predicted_classes: list[int] = []
+    entropies: list[float] = []
+    margins: list[float] = []
+    invalid = 0
+    was_training = model.training
     model.eval()
+    previous_cache = model.config.use_cache
+    model.config.use_cache = True
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     with torch.inference_mode():
-        for batch_index, batch in enumerate(loader):
-            batch = _move_batch(batch, model.device)
-            labels = batch.pop("labels")
-            if reporter is not None and batch_index == 0:
-                reporter.reset_peak()
-            logits = model(**batch).logits
-            if reporter is not None and batch_index == 0:
-                reporter.record_peak("peak_inference_step")
-            predicted_classes.extend(logits.argmax(dim=-1).cpu().tolist())
-            true_classes.extend(labels.cpu().tolist())
+        for row in rows:
+            messages = build_messages(
+                row,
+                image_root,
+                min_pixels=config.model.min_pixels,
+                max_pixels=config.model.max_pixels,
+            )
+            scores: list[float] | None = None
+            if mode == "generate":
+                order = generate_order(
+                    model,
+                    processor,
+                    messages,
+                    max_new_tokens=config.training.generation_max_new_tokens,
+                )
+                if order is None:
+                    invalid += 1
+                    order, scores = score_order(
+                        model,
+                        processor,
+                        messages,
+                        chunk_size=config.training.scoring_chunk_size,
+                    )
+            else:
+                order, scores = score_order(
+                    model,
+                    processor,
+                    messages,
+                    chunk_size=config.training.scoring_chunk_size,
+                )
+            if scores is not None:
+                entropy, margin = _candidate_diagnostics(scores)
+                entropies.append(entropy)
+                margins.append(margin)
+            predicted_classes.append(answer_to_class_id(order_to_answer(order)))
+            true_classes.append(int(row["class_id"]))
+    model.config.use_cache = previous_cache
+    if was_training:
+        model.train()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return summarize_predictions(
         true_classes,
         predicted_classes,
-        num_classes=num_classes,
-        collapse_threshold=collapse_threshold,
+        collapse_threshold=config.training.collapse_threshold,
+        invalid_generations=invalid,
+        entropies=entropies,
+        margins=margins,
     )
 
 
-def print_evaluation(name: str, evaluation: dict[str, Any]) -> None:
+def print_evaluation(name: str, result: dict[str, Any]) -> None:
     print(
-        f"{name} exact_match={evaluation['exact_match_accuracy']:.4f} "
-        f"pairwise={evaluation['pairwise_accuracy']:.4f} "
-        f"macro_recall={evaluation['macro_recall']:.4f} "
-        f"max_class_share={evaluation['max_prediction_share']:.4f}"
+        f"{name} exact_match={result['exact_match_accuracy']:.4f} "
+        f"pairwise={result['pairwise_accuracy']:.4f} "
+        f"macro_recall={result['macro_recall']:.4f} "
+        f"max_class_share={result['max_prediction_share']:.4f} "
+        f"invalid={result['invalid_generations']} "
+        f"entropy={result['candidate_entropy_mean']} margin={result['candidate_margin_mean']}"
     )
-    print(f"{name} prediction_histogram={evaluation['predicted_class_histogram']}")
-    if evaluation["collapse_detected"]:
-        print(
-            f"WARNING: {name} prediction collapse detected; one class exceeds "
-            "the configured share threshold"
-        )
+    print(f"{name} prediction_histogram={result['predicted_class_histogram']}")
+    if result["collapse_detected"]:
+        print(f"WARNING: {name} prediction collapse detected")
+
+
+def _capture_rng_state(torch: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(torch: Any, state: dict[str, Any]) -> None:
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 
 def save_checkpoint(
@@ -176,24 +237,14 @@ def save_checkpoint(
     *,
     global_step: int,
     epoch: int,
+    next_batch_index: int,
     metrics: list[dict[str, Any]],
-    class_weights: list[float],
     reporter: Any,
 ) -> None:
     import torch
 
     layout.create()
-    model.backbone.save_pretrained(layout.adapter_dir, safe_serialization=True)
-    torch.save(model.classifier.state_dict(), layout.classifier_head_path)
-    torch.save(
-        {
-            "global_step": global_step,
-            "epoch": epoch,
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-        },
-        layout.trainer_state_path,
-    )
+    model.save_pretrained(layout.adapter_dir, safe_serialization=True)
     config.save(layout.config_path)
     write_json(layout.metrics_path, metrics)
     write_json(
@@ -201,46 +252,49 @@ def save_checkpoint(
         {
             "pipeline": "candidate_model_1",
             "architecture_version": config.architecture_version,
+            "objective": "completion-only causal language modeling",
+            "target_representation": "chronological input-image indices",
             "base_model": config.model.base_model_path,
             "processor": config.model.processor_path or config.model.base_model_path,
-            "num_classes": 24,
-            "hidden_size": int(model.classifier[0].normalized_shape[0]),
-            "label_mapping": "snu_ordering.permutation canonical lexicographic mapping",
-            "pooling": "final hidden state at assistant generation position",
-            "class_weights": class_weights,
-            "torch_version": version("torch"),
-            "transformers_version": version("transformers"),
-            "peft_version": version("peft"),
-            "compute_dtype": config.quantization.compute_dtype,
-            "min_pixels": config.model.min_pixels,
-            "max_pixels": config.model.max_pixels,
             "global_step": global_step,
             "epoch": epoch,
+            "next_batch_index": next_batch_index,
+            "min_pixels": config.model.min_pixels,
+            "max_pixels": config.model.max_pixels,
         },
+    )
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "global_step": global_step,
+            "epoch": epoch,
+            "next_batch_index": next_batch_index,
+            "rng_state": _capture_rng_state(torch),
+        },
+        layout.trainer_state_path,
     )
     reporter.save(layout.memory_path)
 
 
 def parse_args(default_tiny: bool = False) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config")
     parser.add_argument("--train-csv", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--config", help="Optional Candidate1 run_config.json")
-    parser.add_argument("--base-model", help="Hub ID or local model path")
-    parser.add_argument("--processor", help="Hub ID or local processor path")
+    parser.add_argument("--base-model")
+    parser.add_argument("--processor")
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--gradient-accumulation-steps", type=int)
     parser.add_argument("--learning-rate", type=float)
-    parser.add_argument("--classifier-learning-rate", type=float)
     parser.add_argument("--warmup-ratio", type=float)
-    parser.add_argument("--class-weight-power", type=float)
+    parser.add_argument("--fast-validation-every-steps", type=int)
     parser.add_argument("--fast-validation-size", type=int)
-    parser.add_argument("--full-validation-every-epochs", type=int)
-    parser.add_argument("--collapse-threshold", type=float)
-    parser.add_argument("--success-accuracy", type=float)
+    parser.add_argument("--constrained-validation-size", type=int)
+    parser.add_argument("--scoring-chunk-size", type=int)
     parser.add_argument("--lora-rank", type=int)
     parser.add_argument("--lora-alpha", type=int)
     parser.add_argument("--lora-dropout", type=float)
@@ -280,47 +334,16 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
         epochs=args.epochs or config.training.epochs,
         max_steps=args.max_steps if args.max_steps is not None else config.training.max_steps,
         batch_size=args.batch_size or config.training.batch_size,
-        gradient_accumulation_steps=(
-            args.gradient_accumulation_steps or config.training.gradient_accumulation_steps
-        ),
+        gradient_accumulation_steps=args.gradient_accumulation_steps or config.training.gradient_accumulation_steps,
         learning_rate=args.learning_rate or config.training.learning_rate,
-        classifier_learning_rate=(
-            args.classifier_learning_rate or config.training.classifier_learning_rate
-        ),
-        warmup_ratio=(
-            args.warmup_ratio
-            if args.warmup_ratio is not None
-            else config.training.warmup_ratio
-        ),
-        class_weight_power=(
-            args.class_weight_power
-            if args.class_weight_power is not None
-            else config.training.class_weight_power
-        ),
-        fast_validation_size=(
-            args.fast_validation_size or config.training.fast_validation_size
-        ),
-        full_validation_every_epochs=(
-            args.full_validation_every_epochs
-            or config.training.full_validation_every_epochs
-        ),
-        collapse_threshold=(
-            args.collapse_threshold
-            if args.collapse_threshold is not None
-            else config.training.collapse_threshold
-        ),
-        success_accuracy=(
-            args.success_accuracy
-            if args.success_accuracy is not None
-            else config.training.success_accuracy
-        ),
+        warmup_ratio=args.warmup_ratio if args.warmup_ratio is not None else config.training.warmup_ratio,
+        fast_validation_every_steps=args.fast_validation_every_steps or config.training.fast_validation_every_steps,
+        fast_validation_size=args.fast_validation_size or config.training.fast_validation_size,
+        constrained_validation_size=args.constrained_validation_size or config.training.constrained_validation_size,
+        scoring_chunk_size=args.scoring_chunk_size or config.training.scoring_chunk_size,
         tiny_subset_size=args.tiny_subset_size or config.training.tiny_subset_size,
         tiny_max_steps=args.tiny_max_steps or config.training.tiny_max_steps,
-        tiny_success_accuracy=(
-            args.tiny_success_accuracy
-            if args.tiny_success_accuracy is not None
-            else config.training.tiny_success_accuracy
-        ),
+        tiny_success_accuracy=args.tiny_success_accuracy if args.tiny_success_accuracy is not None else config.training.tiny_success_accuracy,
     )
     if args.tiny_overfit:
         training = replace(training, gradient_accumulation_steps=1, validation_fraction=0.0)
@@ -334,10 +357,9 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
 
 
 def run_training(args: argparse.Namespace) -> None:
-    config = config_from_args(args)
-
     import torch
     from torch.utils.data import DataLoader
+    from transformers import get_cosine_schedule_with_warmup
 
     from .data import collate_rows
     from .memory import GpuMemoryReporter
@@ -348,6 +370,7 @@ def run_training(args: argparse.Namespace) -> None:
         validate_trainable_parameters,
     )
 
+    config = config_from_args(args)
     random.seed(config.training.seed)
     torch.manual_seed(config.training.seed)
     if torch.cuda.is_available():
@@ -357,18 +380,12 @@ def run_training(args: argparse.Namespace) -> None:
     if args.tiny_overfit:
         train_rows = all_rows[: config.training.tiny_subset_size]
         validation_rows = train_rows
-        if len(train_rows) < config.training.tiny_subset_size:
-            raise ValueError(
-                f"Requested {config.training.tiny_subset_size} tiny samples, found {len(train_rows)}"
-            )
     else:
-        train_rows, validation_rows = deterministic_split(
+        train_rows, validation_rows = stratified_split(
             all_rows, config.training.validation_fraction, config.training.seed
         )
-    class_weights = compute_class_weights(
-        train_rows, config.model.num_classes, config.training.class_weight_power
-    )
-    print(f"class_weights={[round(value, 6) for value in class_weights]}")
+    fast_rows = validation_rows[: config.training.fast_validation_size]
+    constrained_rows = validation_rows[: config.training.constrained_validation_size]
 
     layout = ArtifactLayout(args.output_dir)
     best_layout = ArtifactLayout(layout.root / "best")
@@ -379,20 +396,15 @@ def run_training(args: argparse.Namespace) -> None:
         model = load_resumed_training_model(
             config,
             adapter_path=layout.adapter_dir,
-            classifier_head_path=layout.classifier_head_path,
-            class_weights=class_weights,
+            checkpoint_root=layout.root,
             local_files_only=args.local_files_only,
         )
     else:
-        model = load_training_model(
-            config,
-            class_weights=class_weights,
-            local_files_only=args.local_files_only,
-        )
+        model = load_training_model(config, local_files_only=args.local_files_only)
     validate_trainable_parameters(model)
     reporter.record_current("after_model_load")
 
-    collate_train = lambda values: collate_rows(
+    collate = lambda values: collate_rows(
         values,
         processor,
         args.image_root,
@@ -400,294 +412,214 @@ def run_training(args: argparse.Namespace) -> None:
         max_pixels=config.model.max_pixels,
         include_labels=True,
     )
-    generator = torch.Generator().manual_seed(config.training.seed)
-    train_loader = DataLoader(
-        train_rows,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        generator=generator,
-        collate_fn=collate_train,
-    )
-    validation_loader = DataLoader(
-        validation_rows,
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        collate_fn=collate_train,
-    )
-    fast_validation_loader = DataLoader(
-        validation_rows[: config.training.fast_validation_size],
-        batch_size=config.training.batch_size,
-        shuffle=False,
-        collate_fn=collate_train,
-    )
-
-    micro_batches_per_epoch = len(train_loader)
-    normal_steps = (
-        math.ceil(
-            micro_batches_per_epoch / config.training.gradient_accumulation_steps
-        )
-        * config.training.epochs
+    batches_per_epoch = math.ceil(len(train_rows) / config.training.batch_size)
+    steps_per_epoch = math.ceil(
+        batches_per_epoch / config.training.gradient_accumulation_steps
     )
     target_steps = (
         config.training.tiny_max_steps
         if args.tiny_overfit
-        else (config.training.max_steps or normal_steps)
+        else (config.training.max_steps or steps_per_epoch * config.training.epochs)
     )
-
-    lora_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad and "lora_" in name
-    ]
-    classifier_parameters = [
-        parameter
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad and name.startswith("classifier.")
-    ]
-    trainable = lora_parameters + classifier_parameters
     optimizer = torch.optim.AdamW(
-        [
-            {
-                "params": lora_parameters,
-                "lr": config.training.learning_rate,
-                "group_name": "lora",
-            },
-            {
-                "params": classifier_parameters,
-                "lr": config.training.classifier_learning_rate,
-                "group_name": "classifier",
-            },
-        ],
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
-    from transformers import get_cosine_schedule_with_warmup
-
-    warmup_steps = round(target_steps * config.training.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
-        num_warmup_steps=warmup_steps,
+        num_warmup_steps=round(target_steps * config.training.warmup_ratio),
         num_training_steps=target_steps,
     )
+
     global_step = 0
     start_epoch = 0
-    metrics_history: list[dict[str, Any]] = []
+    start_batch_index = 0
+    metrics: list[dict[str, Any]] = []
     if args.resume:
         state = torch.load(layout.trainer_state_path, map_location="cpu", weights_only=False)
         optimizer.load_state_dict(state["optimizer"])
         scheduler.load_state_dict(state["scheduler"])
         global_step = int(state["global_step"])
         start_epoch = int(state["epoch"])
+        start_batch_index = int(state["next_batch_index"])
+        _restore_rng_state(torch, state["rng_state"])
         if layout.metrics_path.is_file():
-            metrics_history = json.loads(layout.metrics_path.read_text(encoding="utf-8"))
+            metrics = json.loads(layout.metrics_path.read_text(encoding="utf-8"))
 
     best_score = -1.0
-    best_max_prediction_share = 1.0
-    if args.resume and best_layout.metadata_path.is_file():
+    best_pairwise = -1.0
+    best_share = 1.0
+    if best_layout.metadata_path.is_file():
         best_metadata = json.loads(best_layout.metadata_path.read_text(encoding="utf-8"))
         best_score = float(best_metadata.get("best_exact_match_accuracy", -1.0))
-        best_max_prediction_share = float(
-            best_metadata.get("best_max_prediction_share", 1.0)
-        )
-    epoch = start_epoch
-    optimizer.zero_grad(set_to_none=True)
-    measured_train_step = False
-    stop = False
+        best_pairwise = float(best_metadata.get("best_pairwise_accuracy", -1.0))
+        best_share = float(best_metadata.get("best_max_prediction_share", 1.0))
+
     running_loss = 0.0
-    running_micro_batches = 0
-    last_full_validation_step = -1
-    while global_step < target_steps and not stop:
+    running_batches = 0
+    stop = False
+    interrupt_requested = False
+
+    def request_interrupt(signum: int, frame: Any) -> None:
+        nonlocal interrupt_requested
+        interrupt_requested = True
+        print("Interrupt requested; saving after the current optimizer step")
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, request_interrupt)
+    started = time.perf_counter()
+    optimizer.zero_grad(set_to_none=True)
+    epoch = start_epoch
+    while epoch < config.training.epochs and global_step < target_steps and not stop:
+        epoch_rows = list(train_rows)
+        random.Random(config.training.seed + epoch).shuffle(epoch_rows)
+        loader = DataLoader(
+            epoch_rows,
+            batch_size=config.training.batch_size,
+            shuffle=False,
+            collate_fn=collate,
+        )
         model.train()
         accumulated = 0
-        for batch_index, batch in enumerate(train_loader, start=1):
-            if not measured_train_step:
+        for batch_index, batch in enumerate(loader):
+            if epoch == start_epoch and batch_index < start_batch_index:
+                continue
+            if global_step >= target_steps:
+                break
+            batch = {key: value.to(model.device) for key, value in batch.items()}
+            if global_step == 0 and accumulated == 0:
                 reporter.reset_peak()
-            batch = _move_batch(batch, model.device)
             raw_loss = model(**batch).loss
             running_loss += float(raw_loss.item())
-            running_micro_batches += 1
-            loss = raw_loss / config.training.gradient_accumulation_steps
-            loss.backward()
+            running_batches += 1
+            (raw_loss / config.training.gradient_accumulation_steps).backward()
             accumulated += 1
-            accumulation_complete = accumulated >= config.training.gradient_accumulation_steps
-            end_of_epoch = batch_index == micro_batches_per_epoch
-            if not accumulation_complete and not end_of_epoch:
+            end_of_epoch = batch_index + 1 == len(loader)
+            if accumulated < config.training.gradient_accumulation_steps and not end_of_epoch:
                 continue
-            torch.nn.utils.clip_grad_norm_(trainable, config.training.max_grad_norm)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad],
+                config.training.max_grad_norm,
+            )
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             accumulated = 0
             global_step += 1
-            if not measured_train_step:
+            if global_step == 1:
                 reporter.record_peak("peak_training_step")
-                measured_train_step = True
 
-            if global_step % config.training.log_every_steps == 0 or global_step == 1:
-                average_loss = running_loss / max(running_micro_batches, 1)
-                rates = {
-                    group.get("group_name", str(index)): group["lr"]
-                    for index, group in enumerate(optimizer.param_groups)
-                }
+            if global_step == 1 or global_step % config.training.log_every_steps == 0:
+                average_loss = running_loss / max(running_batches, 1)
+                elapsed_minutes = (time.perf_counter() - started) / 60
                 print(
                     f"epoch={epoch} step={global_step}/{target_steps} "
-                    f"loss={average_loss:.6f} learning_rates={rates}"
+                    f"loss={average_loss:.6f} lr={scheduler.get_last_lr()[0]:.8g} "
+                    f"elapsed_min={elapsed_minutes:.1f}"
                 )
                 running_loss = 0.0
-                running_micro_batches = 0
+                running_batches = 0
 
-            should_evaluate = args.tiny_overfit and (
-                global_step % 25 == 0 or global_step == target_steps
-            )
-            if should_evaluate:
-                evaluation = evaluate(
-                    model,
-                    validation_loader,
-                    num_classes=config.model.num_classes,
-                    collapse_threshold=config.training.collapse_threshold,
-                    reporter=reporter if global_step == 25 else None,
-                )
-                record = {"step": global_step, "split": "tiny_train", **evaluation}
-                metrics_history.append(record)
-                print_evaluation(f"tiny step={global_step}", evaluation)
-                if float(evaluation["exact_match_accuracy"] or 0.0) >= config.training.tiny_success_accuracy:
-                    print(
-                        f"TINY OVERFIT PASS: exact-match >= {config.training.tiny_success_accuracy:.2f} "
-                        f"at step {global_step}"
-                    )
-                    stop = True
-
-            if global_step % config.training.save_every_steps == 0 or stop:
+            next_batch = batch_index + 1
+            if interrupt_requested:
                 save_checkpoint(
-                    model,
-                    optimizer,
-                    scheduler,
-                    config,
-                    layout,
-                    global_step=global_step,
-                    epoch=epoch,
-                    metrics=metrics_history,
-                    class_weights=class_weights,
-                    reporter=reporter,
+                    model, optimizer, scheduler, config, layout,
+                    global_step=global_step, epoch=epoch,
+                    next_batch_index=next_batch, metrics=metrics, reporter=reporter,
                 )
-            if global_step >= target_steps or stop:
+                print(f"Saved interrupted run at step {global_step}")
+                stop = True
+                break
+            if global_step % config.training.save_every_steps == 0:
+                save_checkpoint(
+                    model, optimizer, scheduler, config, layout,
+                    global_step=global_step, epoch=epoch,
+                    next_batch_index=next_batch, metrics=metrics, reporter=reporter,
+                )
+
+            if args.tiny_overfit and (global_step % 50 == 0 or global_step == target_steps):
+                result = evaluate_rows(
+                    model, processor, validation_rows, args.image_root, config, mode="score"
+                )
+                metrics.append({"step": global_step, "split": "tiny_train", **result})
+                print_evaluation(f"tiny step={global_step}", result)
+                if result["exact_match_accuracy"] >= config.training.tiny_success_accuracy:
+                    print(f"TINY OVERFIT PASS at step {global_step}")
+                    stop = True
+            elif (
+                not args.tiny_overfit
+                and global_step % config.training.fast_validation_every_steps == 0
+            ):
+                result = evaluate_rows(
+                    model, processor, fast_rows, args.image_root, config, mode="generate"
+                )
+                metrics.append({"step": global_step, "epoch": epoch + 1, "split": "validation_fast", **result})
+                print_evaluation(f"validation_fast step={global_step}", result)
+
+            if stop or global_step >= target_steps:
                 break
 
-        if not args.tiny_overfit:
-            completed_epoch = epoch + 1
-            fast_evaluation = evaluate(
-                model,
-                fast_validation_loader,
-                num_classes=config.model.num_classes,
-                collapse_threshold=config.training.collapse_threshold,
+        if interrupt_requested:
+            break
+        completed_epoch = epoch + 1
+        if not args.tiny_overfit and start_batch_index < len(loader):
+            result = evaluate_rows(
+                model, processor, constrained_rows, args.image_root, config, mode="score"
             )
-            metrics_history.append(
-                {
-                    "step": global_step,
-                    "epoch": completed_epoch,
-                    "split": "validation_fast",
-                    **fast_evaluation,
-                }
-            )
-            print_evaluation(f"validation_fast epoch={completed_epoch}", fast_evaluation)
-
-            full_validation_due = (
-                completed_epoch % config.training.full_validation_every_epochs == 0
-                or global_step >= target_steps
-            )
-            if full_validation_due:
-                full_evaluation = evaluate(
-                    model,
-                    validation_loader,
-                    num_classes=config.model.num_classes,
-                    collapse_threshold=config.training.collapse_threshold,
-                    reporter=reporter if last_full_validation_step == -1 else None,
+            metrics.append({"step": global_step, "epoch": completed_epoch, "split": "validation_score", **result})
+            print_evaluation(f"validation_score epoch={completed_epoch}", result)
+            if interrupt_requested:
+                stop = True
+            score = float(result["exact_match_accuracy"])
+            pairwise = float(result["pairwise_accuracy"])
+            share = float(result["max_prediction_share"])
+            improved = (score, pairwise, -share) > (best_score, best_pairwise, -best_share)
+            if improved:
+                best_score, best_pairwise, best_share = score, pairwise, share
+                save_checkpoint(
+                    model, optimizer, scheduler, config, best_layout,
+                    global_step=global_step, epoch=completed_epoch,
+                    next_batch_index=0, metrics=metrics, reporter=reporter,
                 )
-                metrics_history.append(
-                    {
-                        "step": global_step,
-                        "epoch": completed_epoch,
-                        "split": "validation",
-                        **full_evaluation,
-                    }
+                metadata = json.loads(best_layout.metadata_path.read_text(encoding="utf-8"))
+                metadata.update({
+                    "best_exact_match_accuracy": best_score,
+                    "best_pairwise_accuracy": best_pairwise,
+                    "best_max_prediction_share": best_share,
+                })
+                write_json(best_layout.metadata_path, metadata)
+                print(f"Saved new best checkpoint to {best_layout.root}")
+            if completed_epoch == 1 and (
+                score <= config.training.success_accuracy
+                or share >= config.training.collapse_threshold
+            ):
+                print(
+                    "EARLY STOP: epoch 1 did not clear the v3 acceptance gate; "
+                    "inspect completion loss and prediction diagnostics before continuing"
                 )
-                print_evaluation(
-                    f"validation epoch={completed_epoch}", full_evaluation
-                )
-                last_full_validation_step = global_step
-                full_score = float(full_evaluation["exact_match_accuracy"] or 0.0)
-                if full_score > best_score:
-                    best_score = full_score
-                    best_max_prediction_share = float(
-                        full_evaluation["max_prediction_share"]
-                    )
-                    save_checkpoint(
-                        model,
-                        optimizer,
-                        scheduler,
-                        config,
-                        best_layout,
-                        global_step=global_step,
-                        epoch=completed_epoch,
-                        metrics=metrics_history,
-                        class_weights=class_weights,
-                        reporter=reporter,
-                    )
-                    best_metadata = json.loads(
-                        best_layout.metadata_path.read_text(encoding="utf-8")
-                    )
-                    best_metadata["best_exact_match_accuracy"] = best_score
-                    best_metadata["best_max_prediction_share"] = (
-                        best_max_prediction_share
-                    )
-                    write_json(best_layout.metadata_path, best_metadata)
-                    print(
-                        f"Saved new best checkpoint: exact_match={best_score:.4f} "
-                        f"to {best_layout.root}"
-                    )
+                stop = True
         epoch += 1
-
-    if not args.tiny_overfit and last_full_validation_step != global_step:
-        evaluation = evaluate(
-            model,
-            validation_loader,
-            num_classes=config.model.num_classes,
-            collapse_threshold=config.training.collapse_threshold,
-            reporter=reporter,
-        )
-        metrics_history.append({"step": global_step, "split": "validation", **evaluation})
-        print_evaluation("validation final", evaluation)
-    elif args.tiny_overfit and not stop:
-        final_accuracy = float(metrics_history[-1]["exact_match_accuracy"] or 0.0)
-        print(
-            f"TINY OVERFIT FAIL: exact-match={final_accuracy:.4f} < "
-            f"{config.training.tiny_success_accuracy:.2f} after {global_step} steps"
+        start_batch_index = 0
+        save_checkpoint(
+            model, optimizer, scheduler, config, layout,
+            global_step=global_step, epoch=epoch,
+            next_batch_index=0, metrics=metrics, reporter=reporter,
         )
 
-    save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        config,
-        layout,
-        global_step=global_step,
-        epoch=epoch,
-        metrics=metrics_history,
-        class_weights=class_weights,
-        reporter=reporter,
-    )
+    if args.tiny_overfit and not stop:
+        print(f"TINY OVERFIT FAIL after {global_step} steps")
     if not args.tiny_overfit:
-        passed = (
-            best_score >= config.training.success_accuracy
-            and best_max_prediction_share <= config.training.collapse_threshold
-        )
-        status = "PASS" if passed else "FAIL"
+        status = "PASS" if (
+            best_score > config.training.success_accuracy
+            and best_share < config.training.collapse_threshold
+        ) else "FAIL"
         print(
             f"VALIDATION {status}: best_exact_match={best_score:.4f} "
-            f"required={config.training.success_accuracy:.4f} "
-            f"max_class_share={best_max_prediction_share:.4f} "
-            f"allowed={config.training.collapse_threshold:.4f}"
+            f"max_class_share={best_share:.4f}"
         )
     reporter.print_report()
+    signal.signal(signal.SIGINT, previous_sigint)
     print(f"Artifacts saved to {layout.root}")
 
 
@@ -695,12 +627,11 @@ def main(default_tiny: bool = False) -> None:
     args = parse_args(default_tiny=default_tiny)
     layout = ArtifactLayout(args.output_dir)
     layout.create()
-    log_path = layout.root / "train.log"
-    with log_path.open("a", encoding="utf-8") as log_handle:
-        stdout = TeeStream(sys.stdout, log_handle)
-        stderr = TeeStream(sys.stderr, log_handle)
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            print(f"=== Candidate1 train start: {Path.cwd()} ===")
+    with (layout.root / "train.log").open("a", encoding="utf-8") as log_handle:
+        with contextlib.redirect_stdout(TeeStream(sys.stdout, log_handle)), contextlib.redirect_stderr(
+            TeeStream(sys.stderr, log_handle)
+        ):
+            print(f"=== Candidate1 v3 train start: {Path.cwd()} ===")
             print(f"argv: {' '.join(sys.argv)}")
             try:
                 run_training(args)
