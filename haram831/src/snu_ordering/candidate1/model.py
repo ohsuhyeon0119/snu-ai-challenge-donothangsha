@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .config import Candidate1Config
+from .config import Candidate1Config, LEGACY_ARCHITECTURE_VERSION
 
 
 def _compute_dtype(torch: Any, requested: str) -> Any:
@@ -119,7 +119,8 @@ def extract_multimodal_hidden_state(backbone: Any, inputs: dict[str, Any]) -> An
     It therefore avoids allocating unused vocabulary logits and retaining every
     hidden layer for this classification-only pipeline.
     """
-    core = backbone.get_base_model() if hasattr(backbone, "get_base_model") else backbone
+    visual_model = backbone.get_base_model() if hasattr(backbone, "get_base_model") else backbone
+    core = getattr(visual_model, "model", visual_model)
     input_ids = inputs["input_ids"]
     attention_mask = inputs.get("attention_mask")
     image_grid_thw = inputs.get("image_grid_thw")
@@ -131,8 +132,8 @@ def extract_multimodal_hidden_state(backbone: Any, inputs: dict[str, Any]) -> An
         pixel_values = inputs.get(pixel_key)
         if pixel_values is None:
             return
-        pixel_values = pixel_values.type(core.visual.get_dtype())
-        visual_embeds = core.visual(pixel_values, grid_thw=grid)
+        pixel_values = pixel_values.type(visual_model.visual.get_dtype())
+        visual_embeds = visual_model.visual(pixel_values, grid_thw=grid)
         token_mask = input_ids == token_id
         token_count = int(token_mask.sum().item())
         feature_count = int(visual_embeds.shape[0])
@@ -163,7 +164,9 @@ def extract_multimodal_hidden_state(backbone: Any, inputs: dict[str, Any]) -> An
     return outputs.last_hidden_state
 
 
-def create_classifier(backbone: Any, config: Candidate1Config) -> Any:
+def create_classifier(
+    backbone: Any, config: Candidate1Config, *, class_weights: Any = None
+) -> Any:
     import torch
     from torch import nn
 
@@ -181,6 +184,10 @@ def create_classifier(backbone: Any, config: Candidate1Config) -> Any:
                 nn.Dropout(config.model.classifier_dropout),
                 nn.Linear(hidden_size, config.model.num_classes),
             )
+            weights = torch.empty(0) if class_weights is None else torch.as_tensor(
+                class_weights, dtype=torch.float32
+            )
+            self.register_buffer("class_weights", weights, persistent=False)
 
         @property
         def device(self) -> Any:
@@ -192,7 +199,12 @@ def create_classifier(backbone: Any, config: Candidate1Config) -> Any:
             final_hidden_state = extract_multimodal_hidden_state(self.backbone, inputs)
             pooled = pool_last_non_padding(final_hidden_state, inputs["attention_mask"])
             logits = self.classifier(pooled.to(next(self.classifier.parameters()).dtype))
-            loss = None if labels is None else torch.nn.functional.cross_entropy(logits, labels)
+            weight = None
+            if self.class_weights.numel() > 0:
+                weight = self.class_weights.to(device=logits.device, dtype=logits.dtype)
+            loss = None if labels is None else torch.nn.functional.cross_entropy(
+                logits, labels, weight=weight
+            )
             return SequenceClassifierOutput(loss=loss, logits=logits)
 
     model = QwenPermutationClassifier()
@@ -200,11 +212,35 @@ def create_classifier(backbone: Any, config: Candidate1Config) -> Any:
     return model
 
 
-def load_training_model(config: Candidate1Config, *, local_files_only: bool = False) -> Any:
+def load_training_model(
+    config: Candidate1Config,
+    *,
+    class_weights: Any = None,
+    local_files_only: bool = False,
+) -> Any:
     backbone = attach_trainable_lora(
         load_base_backbone(config, local_files_only=local_files_only), config
     )
-    return create_classifier(backbone, config)
+    return create_classifier(backbone, config, class_weights=class_weights)
+
+
+def validate_checkpoint_architecture(
+    config: Candidate1Config, classifier_head_path: str | Path
+) -> dict[str, Any]:
+    """Reject checkpoints produced by a different prompt/model contract."""
+    metadata_path = Path(classifier_head_path).with_name("metadata.json")
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Checkpoint metadata does not exist: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    checkpoint_version = metadata.get(
+        "architecture_version", LEGACY_ARCHITECTURE_VERSION
+    )
+    if checkpoint_version != config.architecture_version:
+        raise ValueError(
+            "Checkpoint architecture does not match run config: "
+            f"checkpoint={checkpoint_version!r}, config={config.architecture_version!r}"
+        )
+    return metadata
 
 
 def load_resumed_training_model(
@@ -212,12 +248,14 @@ def load_resumed_training_model(
     *,
     adapter_path: str | Path,
     classifier_head_path: str | Path,
+    class_weights: Any = None,
     local_files_only: bool = False,
 ) -> Any:
     """Reload adapters and head as trainable parameters for optimizer resume."""
     import torch
     from peft import PeftModel
 
+    validate_checkpoint_architecture(config, classifier_head_path)
     base = load_base_backbone(config, local_files_only=local_files_only)
     backbone = PeftModel.from_pretrained(
         base, str(adapter_path), is_trainable=True, local_files_only=local_files_only
@@ -226,7 +264,7 @@ def load_resumed_training_model(
         backbone.enable_input_require_grads()
         backbone.gradient_checkpointing_enable()
         backbone.config.use_cache = False
-    model = create_classifier(backbone, config)
+    model = create_classifier(backbone, config, class_weights=class_weights)
     state = torch.load(classifier_head_path, map_location=model.device, weights_only=True)
     model.classifier.load_state_dict(state)
     return model
@@ -246,22 +284,20 @@ def load_inference_model(
     backbone = PeftModel.from_pretrained(
         base, str(adapter_path), is_trainable=False, local_files_only=local_files_only
     )
-    metadata_path = Path(classifier_head_path).with_name("metadata.json")
-    if metadata_path.is_file():
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        expected = {
-            "num_classes": config.model.num_classes,
-            "hidden_size": _hidden_size(backbone),
-            "min_pixels": config.model.min_pixels,
-            "max_pixels": config.model.max_pixels,
-        }
-        mismatches = {
-            key: (metadata.get(key), value)
-            for key, value in expected.items()
-            if metadata.get(key) != value
-        }
-        if mismatches:
-            raise ValueError(f"Checkpoint metadata does not match inference config: {mismatches}")
+    metadata = validate_checkpoint_architecture(config, classifier_head_path)
+    expected = {
+        "num_classes": config.model.num_classes,
+        "hidden_size": _hidden_size(backbone),
+        "min_pixels": config.model.min_pixels,
+        "max_pixels": config.model.max_pixels,
+    }
+    mismatches = {
+        key: (metadata.get(key), value)
+        for key, value in expected.items()
+        if metadata.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Checkpoint metadata does not match inference config: {mismatches}")
     model = create_classifier(backbone, config)
     state = torch.load(classifier_head_path, map_location=model.device, weights_only=True)
     model.classifier.load_state_dict(state)

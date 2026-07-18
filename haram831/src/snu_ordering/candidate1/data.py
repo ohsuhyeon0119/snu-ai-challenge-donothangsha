@@ -14,7 +14,10 @@ INSTRUCTION = (
     "Caption:\n{sentence}\n\n"
     "The four frames above are Input_1 through Input_4 in shuffled order. "
     "Use the complete caption and all four frames to identify their original temporal positions. "
-    "The model must predict one canonical permutation class_id from 0 through 23."
+    "Return [p1, p2, p3, p4], where pi is the original temporal position of Input_i. "
+    "For example, [1, 4, 2, 3] means Input_1 is first, Input_2 is fourth, "
+    "Input_3 is second, and Input_4 is third. If the frames are already chronological, "
+    "return [1, 2, 3, 4]."
 )
 
 
@@ -56,6 +59,13 @@ def validate_image_grid_count(image_grid_thw: Any, *, batch_size: int) -> None:
         )
 
 
+def render_chat_prompt(processor: Any, messages: list[dict[str, Any]]) -> str:
+    """Render the state from which Qwen would generate its ordering answer."""
+    return processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+
 def collate_rows(
     rows: Sequence[Mapping[str, Any]],
     processor: Any,
@@ -78,11 +88,7 @@ def collate_rows(
         messages = build_messages(
             row, image_root, min_pixels=min_pixels, max_pixels=max_pixels
         )
-        texts.append(
-            processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=False
-            )
-        )
+        texts.append(render_chat_prompt(processor, messages))
         image_inputs, _ = process_vision_info(messages)
         images.extend(image_inputs)
 

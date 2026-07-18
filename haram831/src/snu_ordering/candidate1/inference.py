@@ -44,6 +44,7 @@ def main() -> None:
 
     config = Candidate1Config.load(args.config)
     config = Candidate1Config(
+        architecture_version=config.architecture_version,
         model=ModelConfig(
             **{
                 **config.model.__dict__,
