@@ -6,6 +6,7 @@ __pycache__/
 # docs
 docs/*
 !docs/VAST_LOCAL_MODEL_UPLOAD.md
+!docs/OVERNIGHT_PALIGEMMA_RUN.md
 
 # local outputs and competition artifacts
 outputs/
