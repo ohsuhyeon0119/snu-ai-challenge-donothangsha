@@ -23,6 +23,25 @@ from .artifacts import ArtifactLayout, write_json
 from .config import Candidate1Config
 
 
+MAX_OOM_SKIPS = 8
+
+
+def is_cuda_out_of_memory(error: BaseException) -> bool:
+    """Recognize both PyTorch OOM exception variants without version coupling."""
+    message = str(error).lower()
+    return "out of memory" in message and ("cuda" in message or "accelerator" in message)
+
+
+def recover_from_cuda_oom(torch: Any, optimizer: Any) -> None:
+    """Discard partial gradients and release cached allocations after a skipped batch."""
+    import gc
+
+    optimizer.zero_grad(set_to_none=True)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 class TeeStream:
     def __init__(self, *streams: Any):
         self.streams = streams
@@ -293,7 +312,13 @@ def parse_args(default_tiny: bool = False) -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float)
     parser.add_argument("--fast-validation-every-steps", type=int)
     parser.add_argument("--fast-validation-size", type=int)
-    parser.add_argument("--constrained-validation-size", type=int)
+    parser.add_argument(
+        "--epoch-validation-size",
+        "--constrained-validation-size",
+        dest="epoch_validation_size",
+        type=int,
+        help="Greedy-generation samples used for epoch-end model selection",
+    )
     parser.add_argument("--scoring-chunk-size", type=int)
     parser.add_argument("--lora-rank", type=int)
     parser.add_argument("--lora-alpha", type=int)
@@ -339,7 +364,7 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
         warmup_ratio=args.warmup_ratio if args.warmup_ratio is not None else config.training.warmup_ratio,
         fast_validation_every_steps=args.fast_validation_every_steps or config.training.fast_validation_every_steps,
         fast_validation_size=args.fast_validation_size or config.training.fast_validation_size,
-        constrained_validation_size=args.constrained_validation_size or config.training.constrained_validation_size,
+        epoch_validation_size=args.epoch_validation_size or config.training.epoch_validation_size,
         scoring_chunk_size=args.scoring_chunk_size or config.training.scoring_chunk_size,
         tiny_subset_size=args.tiny_subset_size or config.training.tiny_subset_size,
         tiny_max_steps=args.tiny_max_steps or config.training.tiny_max_steps,
@@ -385,7 +410,7 @@ def run_training(args: argparse.Namespace) -> None:
             all_rows, config.training.validation_fraction, config.training.seed
         )
     fast_rows = validation_rows[: config.training.fast_validation_size]
-    constrained_rows = validation_rows[: config.training.constrained_validation_size]
+    epoch_validation_rows = validation_rows[: config.training.epoch_validation_size]
 
     layout = ArtifactLayout(args.output_dir)
     best_layout = ArtifactLayout(layout.root / "best")
@@ -458,6 +483,7 @@ def run_training(args: argparse.Namespace) -> None:
 
     running_loss = 0.0
     running_batches = 0
+    oom_skips = 0
     stop = False
     interrupt_requested = False
 
@@ -487,13 +513,40 @@ def run_training(args: argparse.Namespace) -> None:
                 continue
             if global_step >= target_steps:
                 break
-            batch = {key: value.to(model.device) for key, value in batch.items()}
-            if global_step == 0 and accumulated == 0:
-                reporter.reset_peak()
-            raw_loss = model(**batch).loss
-            running_loss += float(raw_loss.item())
+            try:
+                batch = {key: value.to(model.device) for key, value in batch.items()}
+                if global_step == 0 and accumulated == 0:
+                    reporter.reset_peak()
+                raw_loss = model(**batch).loss
+                loss_value = float(raw_loss.item())
+                (raw_loss / config.training.gradient_accumulation_steps).backward()
+            except Exception as error:
+                if not is_cuda_out_of_memory(error):
+                    raise
+                oom_skips += 1
+                accumulated = 0
+                batch = None
+                raw_loss = None
+                recover_from_cuda_oom(torch, optimizer)
+                print(
+                    f"WARNING: CUDA OOM at epoch={epoch} batch={batch_index}; "
+                    f"discarded partial gradient accumulation and skipped batch "
+                    f"({oom_skips}/{MAX_OOM_SKIPS})"
+                )
+                if oom_skips > MAX_OOM_SKIPS:
+                    raise RuntimeError(
+                        f"CUDA OOM occurred more than {MAX_OOM_SKIPS} times; "
+                        "reduce model.max_pixels before resuming"
+                    ) from error
+                save_checkpoint(
+                    model, optimizer, scheduler, config, layout,
+                    global_step=global_step, epoch=epoch,
+                    next_batch_index=batch_index + 1, metrics=metrics, reporter=reporter,
+                )
+                print(f"Saved OOM recovery checkpoint at step {global_step}")
+                continue
+            running_loss += loss_value
             running_batches += 1
-            (raw_loss / config.training.gradient_accumulation_steps).backward()
             accumulated += 1
             end_of_epoch = batch_index + 1 == len(loader)
             if accumulated < config.training.gradient_accumulation_steps and not end_of_epoch:
@@ -540,7 +593,7 @@ def run_training(args: argparse.Namespace) -> None:
 
             if args.tiny_overfit and (global_step % 50 == 0 or global_step == target_steps):
                 result = evaluate_rows(
-                    model, processor, validation_rows, args.image_root, config, mode="score"
+                    model, processor, validation_rows, args.image_root, config, mode="generate"
                 )
                 metrics.append({"step": global_step, "split": "tiny_train", **result})
                 print_evaluation(f"tiny step={global_step}", result)
@@ -565,10 +618,10 @@ def run_training(args: argparse.Namespace) -> None:
         completed_epoch = epoch + 1
         if not args.tiny_overfit and start_batch_index < len(loader):
             result = evaluate_rows(
-                model, processor, constrained_rows, args.image_root, config, mode="score"
+                model, processor, epoch_validation_rows, args.image_root, config, mode="generate"
             )
-            metrics.append({"step": global_step, "epoch": completed_epoch, "split": "validation_score", **result})
-            print_evaluation(f"validation_score epoch={completed_epoch}", result)
+            metrics.append({"step": global_step, "epoch": completed_epoch, "split": "validation_epoch", **result})
+            print_evaluation(f"validation_epoch epoch={completed_epoch}", result)
             if interrupt_requested:
                 stop = True
             score = float(result["exact_match_accuracy"])

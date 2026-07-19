@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-csv", required=True)
     parser.add_argument("--image-root", required=True)
     parser.add_argument("--output-submission", required=True)
-    parser.add_argument("--mode", choices=("score", "generate"), default="score")
+    parser.add_argument("--mode", choices=("generate", "score"), default="generate")
     parser.add_argument("--scoring-chunk-size", type=int)
     parser.add_argument("--limit", type=int, default=None, help="Debug only")
     return parser.parse_args()

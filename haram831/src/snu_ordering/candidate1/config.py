@@ -59,7 +59,7 @@ class TrainingConfig:
     validation_fraction: float = 0.12
     fast_validation_every_steps: int = 400
     fast_validation_size: int = 120
-    constrained_validation_size: int = 160
+    epoch_validation_size: int = 160
     scoring_chunk_size: int = 12
     generation_max_new_tokens: int = 32
     collapse_threshold: float = 0.5
@@ -97,7 +97,7 @@ class Candidate1Config:
         for name in (
             "fast_validation_every_steps",
             "fast_validation_size",
-            "constrained_validation_size",
+            "epoch_validation_size",
             "scoring_chunk_size",
             "generation_max_new_tokens",
         ):
@@ -128,10 +128,14 @@ class Candidate1Config:
         lora = dict(raw.get("lora", {}))
         if "target_modules" in lora:
             lora["target_modules"] = tuple(lora["target_modules"])
+        training = dict(raw.get("training", {}))
+        legacy_validation_size = training.pop("constrained_validation_size", None)
+        if legacy_validation_size is not None and "epoch_validation_size" not in training:
+            training["epoch_validation_size"] = legacy_validation_size
         return cls(
             architecture_version=version,
             model=ModelConfig(**raw.get("model", {})),
             quantization=QuantizationConfig(**raw.get("quantization", {})),
             lora=LoraSettings(**lora),
-            training=TrainingConfig(**raw.get("training", {})),
+            training=TrainingConfig(**training),
         )
