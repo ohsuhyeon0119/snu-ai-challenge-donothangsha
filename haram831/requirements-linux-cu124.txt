@@ -1,0 +1,10 @@
+# Linux x86_64 training environment for the competition RTX 3090 / CUDA 12.4 server.
+# Use CPython 3.11 (supported range for this torch/vision pair: 3.9-3.12).
+# The +cu124 pins prevent pip from silently selecting CPU-only wheels.
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+
+# Candidate1 QLoRA and shared data/test dependencies.
+-r requirements-candidate1.txt
