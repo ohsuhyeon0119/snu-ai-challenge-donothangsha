@@ -67,6 +67,7 @@ _BOUNDARY_RE = re.compile(
     r"|[;,]",
     flags=re.IGNORECASE,
 )
+_PUNCTUATION_SPLIT_RE = re.compile(r"[,;]")
 
 _NEXT_RE = re.compile(
     r"\b(?:followed\s+by|then|next|afterwards?|afterward|subsequently|finally)\b",
@@ -177,3 +178,44 @@ def event_count_bucket(count: int) -> str:
     if count < 1:
         raise ValueError("event count must be positive")
     return str(count) if count <= 4 else "5+"
+
+
+def extract_punctuation_candidates(caption: str) -> tuple[str, ...]:
+    """Split A1 action candidates only at commas and semicolons.
+
+    Temporal words such as ``then`` and ``while`` remain in their surrounding
+    candidate.  This keeps A1 distinct from the relation-aware A2 extractor.
+    """
+
+    if not isinstance(caption, str) or not caption.strip():
+        raise ValueError("caption must contain non-whitespace text")
+    candidates = tuple(
+        part.strip()
+        for part in _PUNCTUATION_SPLIT_RE.split(caption)
+        if part.strip()
+    )
+    return candidates or (caption.strip(),)
+
+
+def render_punctuation_hints(caption: str) -> str:
+    """Render the A1 caption context while preserving the complete original."""
+
+    candidates = extract_punctuation_candidates(caption)
+    lines = [
+        "Original caption:",
+        caption.strip(),
+        "",
+        "Approximate event hints:",
+    ]
+    lines.extend(
+        f"[Event {index}] {candidate}"
+        for index, candidate in enumerate(candidates, start=1)
+    )
+    lines.extend(
+        [
+            "",
+            "The event hints are approximate and may not correspond one-to-one "
+            "with the four images. Use the original caption when the hints are ambiguous.",
+        ]
+    )
+    return "\n".join(lines)

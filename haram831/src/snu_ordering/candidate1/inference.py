@@ -52,6 +52,7 @@ def main() -> None:
         quantization=config.quantization,
         lora=config.lora,
         training=config.training,
+        caption_prompt=config.caption_prompt,
     )
     frame = load_metadata(args.input_csv, split="test", limit=args.limit)
     rows = frame.to_dict(orient="records")
@@ -97,6 +98,7 @@ def main() -> None:
                 args.image_root,
                 min_pixels=config.model.min_pixels,
                 max_pixels=config.model.max_pixels,
+                caption_prompt_mode=config.caption_prompt.mode,
             )
             with torch.inference_mode():
                 if args.mode == "generate":

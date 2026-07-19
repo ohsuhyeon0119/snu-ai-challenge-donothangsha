@@ -8,16 +8,28 @@ from typing import Any
 
 from PIL import Image
 
+from ..caption_structure import render_punctuation_hints
 from ..dataset import INPUT_COLUMNS, resolve_image_paths
 from ..permutation import answer_to_chronological_order, validate_permutation
 
-INSTRUCTION = (
-    'Caption: "{sentence}"\n\n'
+TASK_INSTRUCTION = (
     "The caption describes events in chronological order. The four images above "
     "are shuffled frames from that sequence. Return the image numbers from earliest "
     "to latest as a list such as [3, 1, 4, 2]."
 )
 COMPLETION_TEMPLATE = "The correct chronological order is {order}."
+
+
+def render_instruction(sentence: str, caption_prompt_mode: str) -> str:
+    """Render either the unchanged A0 caption or the punctuation-based A1 prompt."""
+
+    if caption_prompt_mode == "raw":
+        caption_context = f'Caption: "{sentence}"'
+    elif caption_prompt_mode == "punctuation":
+        caption_context = render_punctuation_hints(sentence)
+    else:
+        raise ValueError(f"Unsupported caption prompt mode: {caption_prompt_mode}")
+    return f"{caption_context}\n\n{TASK_INSTRUCTION}"
 
 
 def build_messages(
@@ -26,6 +38,7 @@ def build_messages(
     *,
     min_pixels: int,
     max_pixels: int,
+    caption_prompt_mode: str = "raw",
 ) -> list[dict[str, Any]]:
     """Build one multimodal user message, preserving Input_1..Input_4 order."""
     content: list[dict[str, Any]] = []
@@ -40,9 +53,10 @@ def build_messages(
             }
         )
         content.append({"type": "text", "text": f"Image {index}"})
-    content.append(
-        {"type": "text", "text": INSTRUCTION.format(sentence=str(row["Sentence"]))}
-    )
+    content.append({
+        "type": "text",
+        "text": render_instruction(str(row["Sentence"]), caption_prompt_mode),
+    })
     return [{"role": "user", "content": content}]
 
 
@@ -83,6 +97,7 @@ def collate_rows(
     min_pixels: int,
     max_pixels: int,
     include_labels: bool,
+    caption_prompt_mode: str = "raw",
 ) -> dict[str, Any]:
     """Build a right-padded multimodal batch with prompt tokens masked from loss."""
     import torch
@@ -93,7 +108,11 @@ def collate_rows(
     images: list[Any] = []
     for row in rows:
         messages = build_messages(
-            row, image_root, min_pixels=min_pixels, max_pixels=max_pixels
+            row,
+            image_root,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+            caption_prompt_mode=caption_prompt_mode,
         )
         prompt = render_chat_prompt(processor, messages)
         prompt_texts.append(prompt)

@@ -1,0 +1,50 @@
+{
+  "architecture_version": "candidate1_causal_lm_v3",
+  "model": {
+    "base_model_path": "Qwen/Qwen2-VL-2B-Instruct",
+    "processor_path": null,
+    "min_pixels": 100352,
+    "max_pixels": 200704,
+    "trust_remote_code": false
+  },
+  "quantization": {
+    "enabled": true,
+    "quant_type": "nf4",
+    "double_quant": true,
+    "compute_dtype": "auto"
+  },
+  "lora": {
+    "rank": 32,
+    "alpha": 64,
+    "dropout": 0.05,
+    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  },
+  "training": {
+    "seed": 42,
+    "epochs": 3,
+    "max_steps": null,
+    "batch_size": 1,
+    "gradient_accumulation_steps": 8,
+    "learning_rate": 0.0001,
+    "warmup_ratio": 0.03,
+    "weight_decay": 0.0,
+    "max_grad_norm": 1.0,
+    "validation_fraction": 0.12,
+    "fast_validation_every_steps": 400,
+    "fast_validation_size": 120,
+    "epoch_validation_size": 160,
+    "scoring_chunk_size": 12,
+    "generation_max_new_tokens": 32,
+    "collapse_threshold": 0.5,
+    "success_accuracy": 0.25,
+    "log_every_steps": 20,
+    "save_every_steps": 100,
+    "gradient_checkpointing": true,
+    "tiny_subset_size": 16,
+    "tiny_max_steps": 400,
+    "tiny_success_accuracy": 0.95
+  },
+  "caption_prompt": {
+    "mode": "punctuation"
+  }
+}

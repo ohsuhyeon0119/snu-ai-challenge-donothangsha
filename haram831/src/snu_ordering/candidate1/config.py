@@ -46,6 +46,15 @@ class LoraSettings:
 
 
 @dataclass(frozen=True)
+class CaptionPromptConfig:
+    mode: str = "raw"
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"raw", "punctuation"}:
+            raise ValueError(f"Unsupported caption prompt mode: {self.mode}")
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     seed: int = 42
     epochs: int = 3
@@ -79,6 +88,7 @@ class Candidate1Config:
     quantization: QuantizationConfig = field(default_factory=QuantizationConfig)
     lora: LoraSettings = field(default_factory=LoraSettings)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    caption_prompt: CaptionPromptConfig = field(default_factory=CaptionPromptConfig)
 
     def __post_init__(self) -> None:
         if self.architecture_version != ARCHITECTURE_VERSION:
@@ -138,4 +148,5 @@ class Candidate1Config:
             quantization=QuantizationConfig(**raw.get("quantization", {})),
             lora=LoraSettings(**lora),
             training=TrainingConfig(**training),
+            caption_prompt=CaptionPromptConfig(**raw.get("caption_prompt", {})),
         )

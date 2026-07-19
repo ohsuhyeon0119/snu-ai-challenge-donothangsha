@@ -170,6 +170,7 @@ def evaluate_rows(
                 image_root,
                 min_pixels=config.model.min_pixels,
                 max_pixels=config.model.max_pixels,
+                caption_prompt_mode=config.caption_prompt.mode,
             )
             scores: list[float] | None = None
             if mode == "generate":
@@ -378,6 +379,7 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
         quantization=quantization,
         lora=lora,
         training=training,
+        caption_prompt=config.caption_prompt,
     )
 
 
@@ -436,6 +438,7 @@ def run_training(args: argparse.Namespace) -> None:
         min_pixels=config.model.min_pixels,
         max_pixels=config.model.max_pixels,
         include_labels=True,
+        caption_prompt_mode=config.caption_prompt.mode,
     )
     batches_per_epoch = math.ceil(len(train_rows) / config.training.batch_size)
     steps_per_epoch = math.ceil(
