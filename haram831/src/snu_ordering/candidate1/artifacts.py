@@ -39,6 +39,10 @@ class ArtifactLayout:
     def trainer_state_path(self) -> Path:
         return self.root / "trainer_state.pt"
 
+    @property
+    def pairwise_head_path(self) -> Path:
+        return self.root / "pairwise_head.safetensors"
+
     def create(self) -> None:
         self.adapter_dir.mkdir(parents=True, exist_ok=True)
 

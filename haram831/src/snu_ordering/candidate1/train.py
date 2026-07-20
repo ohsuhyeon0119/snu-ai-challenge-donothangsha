@@ -171,6 +171,8 @@ def evaluate_rows(
                 min_pixels=config.model.min_pixels,
                 max_pixels=config.model.max_pixels,
                 caption_prompt_mode=config.caption_prompt.mode,
+                relation_confidence_threshold=config.caption_prompt.relation_confidence_threshold,
+                boundary_dropout=0.0,
             )
             scores: list[float] | None = None
             if mode == "generate":
@@ -217,6 +219,71 @@ def evaluate_rows(
     )
 
 
+def evaluate_pairwise_head(
+    model: Any,
+    pairwise_head: Any,
+    processor: Any,
+    rows: list[dict[str, Any]],
+    image_root: str | Path,
+    config: Candidate1Config,
+) -> dict[str, float]:
+    """Evaluate the training-only A2 head without affecting model selection."""
+
+    import gc
+    import torch
+
+    from .data import collate_rows
+    from .pairwise import compute_pairwise_auxiliary
+
+    if not rows:
+        return {"aux_pairwise_accuracy": 0.0, "aux_pairwise_bce": 0.0}
+    was_training = model.training
+    head_was_training = pairwise_head.training
+    model.eval()
+    pairwise_head.eval()
+    total_loss = 0.0
+    correct = 0
+    total = 0
+    with torch.inference_mode():
+        for row in rows:
+            batch = collate_rows(
+                [row],
+                processor,
+                image_root,
+                min_pixels=config.model.min_pixels,
+                max_pixels=config.model.max_pixels,
+                include_labels=False,
+                caption_prompt_mode=config.caption_prompt.mode,
+                relation_confidence_threshold=config.caption_prompt.relation_confidence_threshold,
+                boundary_dropout=0.0,
+                include_pairwise_labels=True,
+            )
+            batch = {key: value.to(model.device) for key, value in batch.items()}
+            labels = batch.pop("pairwise_labels")
+            prompt_lengths = batch.pop("prompt_lengths")
+            outputs = model(
+                **batch, output_hidden_states=True, use_cache=False, return_dict=True
+            )
+            loss, logits = compute_pairwise_auxiliary(
+                outputs, pairwise_head, prompt_lengths, labels
+            )
+            total_loss += float(loss.item())
+            predictions = logits >= 0
+            correct += int((predictions == labels.bool()).sum().item())
+            total += int(labels.numel())
+    if was_training:
+        model.train()
+    if head_was_training:
+        pairwise_head.train()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {
+        "aux_pairwise_accuracy": correct / total,
+        "aux_pairwise_bce": total_loss / len(rows),
+    }
+
+
 def print_evaluation(name: str, result: dict[str, Any]) -> None:
     print(
         f"{name} exact_match={result['exact_match_accuracy']:.4f} "
@@ -227,6 +294,11 @@ def print_evaluation(name: str, result: dict[str, Any]) -> None:
         f"entropy={result['candidate_entropy_mean']} margin={result['candidate_margin_mean']}"
     )
     print(f"{name} prediction_histogram={result['predicted_class_histogram']}")
+    if "aux_pairwise_accuracy" in result:
+        print(
+            f"{name} aux_pairwise_accuracy={result['aux_pairwise_accuracy']:.4f} "
+            f"aux_pairwise_bce={result['aux_pairwise_bce']:.6f}"
+        )
     if result["collapse_detected"]:
         print(f"WARNING: {name} prediction collapse detected")
 
@@ -255,6 +327,7 @@ def save_checkpoint(
     config: Candidate1Config,
     layout: ArtifactLayout,
     *,
+    pairwise_head: Any | None = None,
     global_step: int,
     epoch: int,
     next_batch_index: int,
@@ -265,6 +338,10 @@ def save_checkpoint(
 
     layout.create()
     model.save_pretrained(layout.adapter_dir, safe_serialization=True)
+    if pairwise_head is not None:
+        from .pairwise import save_pairwise_head
+
+        save_pairwise_head(pairwise_head, layout.pairwise_head_path)
     config.save(layout.config_path)
     write_json(layout.metrics_path, metrics)
     write_json(
@@ -272,7 +349,11 @@ def save_checkpoint(
         {
             "pipeline": "candidate_model_1",
             "architecture_version": config.architecture_version,
-            "objective": "completion-only causal language modeling",
+            "objective": (
+                "completion-only causal language modeling"
+                if pairwise_head is None
+                else "completion-only causal language modeling + pairwise BCE auxiliary"
+            ),
             "target_representation": "chronological input-image indices",
             "base_model": config.model.base_model_path,
             "processor": config.model.processor_path or config.model.base_model_path,
@@ -281,6 +362,8 @@ def save_checkpoint(
             "next_batch_index": next_batch_index,
             "min_pixels": config.model.min_pixels,
             "max_pixels": config.model.max_pixels,
+            "caption_prompt_mode": config.caption_prompt.mode,
+            "pairwise_loss_weight": config.training.pairwise_loss_weight,
         },
     )
     torch.save(
@@ -333,6 +416,9 @@ def parse_args(default_tiny: bool = False) -> argparse.Namespace:
     parser.add_argument("--tiny-subset-size", type=int)
     parser.add_argument("--tiny-max-steps", type=int)
     parser.add_argument("--tiny-success-accuracy", type=float)
+    parser.add_argument("--relation-confidence-threshold", type=float)
+    parser.add_argument("--boundary-dropout", type=float)
+    parser.add_argument("--pairwise-loss-weight", type=float)
     return parser.parse_args()
 
 
@@ -370,6 +456,20 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
         tiny_subset_size=args.tiny_subset_size or config.training.tiny_subset_size,
         tiny_max_steps=args.tiny_max_steps or config.training.tiny_max_steps,
         tiny_success_accuracy=args.tiny_success_accuracy if args.tiny_success_accuracy is not None else config.training.tiny_success_accuracy,
+        pairwise_loss_weight=args.pairwise_loss_weight if args.pairwise_loss_weight is not None else config.training.pairwise_loss_weight,
+    )
+    caption_prompt = replace(
+        config.caption_prompt,
+        relation_confidence_threshold=(
+            args.relation_confidence_threshold
+            if args.relation_confidence_threshold is not None
+            else config.caption_prompt.relation_confidence_threshold
+        ),
+        boundary_dropout=(
+            args.boundary_dropout
+            if args.boundary_dropout is not None
+            else config.caption_prompt.boundary_dropout
+        ),
     )
     if args.tiny_overfit:
         training = replace(training, gradient_accumulation_steps=1, validation_fraction=0.0)
@@ -379,7 +479,7 @@ def config_from_args(args: argparse.Namespace) -> Candidate1Config:
         quantization=quantization,
         lora=lora,
         training=training,
-        caption_prompt=config.caption_prompt,
+        caption_prompt=caption_prompt,
     )
 
 
@@ -395,6 +495,12 @@ def run_training(args: argparse.Namespace) -> None:
         load_resumed_training_model,
         load_training_model,
         validate_trainable_parameters,
+    )
+    from .pairwise import (
+        combine_training_losses,
+        compute_pairwise_auxiliary,
+        create_pairwise_head,
+        load_pairwise_head,
     )
 
     config = config_from_args(args)
@@ -429,17 +535,12 @@ def run_training(args: argparse.Namespace) -> None:
     else:
         model = load_training_model(config, local_files_only=args.local_files_only)
     validate_trainable_parameters(model)
+    pairwise_head = None
+    if config.training.pairwise_loss_weight > 0.0:
+        pairwise_head = create_pairwise_head(model)
+        if args.resume:
+            load_pairwise_head(pairwise_head, layout.pairwise_head_path)
     reporter.record_current("after_model_load")
-
-    collate = lambda values: collate_rows(
-        values,
-        processor,
-        args.image_root,
-        min_pixels=config.model.min_pixels,
-        max_pixels=config.model.max_pixels,
-        include_labels=True,
-        caption_prompt_mode=config.caption_prompt.mode,
-    )
     batches_per_epoch = math.ceil(len(train_rows) / config.training.batch_size)
     steps_per_epoch = math.ceil(
         batches_per_epoch / config.training.gradient_accumulation_steps
@@ -449,8 +550,13 @@ def run_training(args: argparse.Namespace) -> None:
         if args.tiny_overfit
         else (config.training.max_steps or steps_per_epoch * config.training.epochs)
     )
+    trainable_parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    if pairwise_head is not None:
+        trainable_parameters.extend(pairwise_head.parameters())
     optimizer = torch.optim.AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
+        trainable_parameters,
         lr=config.training.learning_rate,
         weight_decay=config.training.weight_decay,
     )
@@ -485,6 +591,8 @@ def run_training(args: argparse.Namespace) -> None:
         best_share = float(best_metadata.get("best_max_prediction_share", 1.0))
 
     running_loss = 0.0
+    running_lm_loss = 0.0
+    running_pairwise_loss = 0.0
     running_batches = 0
     oom_skips = 0
     stop = False
@@ -503,6 +611,19 @@ def run_training(args: argparse.Namespace) -> None:
     while epoch < config.training.epochs and global_step < target_steps and not stop:
         epoch_rows = list(train_rows)
         random.Random(config.training.seed + epoch).shuffle(epoch_rows)
+        collate = lambda values, current_epoch=epoch: collate_rows(
+            values,
+            processor,
+            args.image_root,
+            min_pixels=config.model.min_pixels,
+            max_pixels=config.model.max_pixels,
+            include_labels=True,
+            caption_prompt_mode=config.caption_prompt.mode,
+            relation_confidence_threshold=config.caption_prompt.relation_confidence_threshold,
+            boundary_dropout=config.caption_prompt.boundary_dropout,
+            boundary_dropout_seed=f"{config.training.seed}:{current_epoch}",
+            include_pairwise_labels=pairwise_head is not None,
+        )
         loader = DataLoader(
             epoch_rows,
             batch_size=config.training.batch_size,
@@ -510,6 +631,8 @@ def run_training(args: argparse.Namespace) -> None:
             collate_fn=collate,
         )
         model.train()
+        if pairwise_head is not None:
+            pairwise_head.train()
         accumulated = 0
         for batch_index, batch in enumerate(loader):
             if epoch == start_epoch and batch_index < start_batch_index:
@@ -518,10 +641,35 @@ def run_training(args: argparse.Namespace) -> None:
                 break
             try:
                 batch = {key: value.to(model.device) for key, value in batch.items()}
+                pairwise_labels = batch.pop("pairwise_labels", None)
+                prompt_lengths = batch.pop("prompt_lengths", None)
                 if global_step == 0 and accumulated == 0:
                     reporter.reset_peak()
-                raw_loss = model(**batch).loss
+                outputs = model(
+                    **batch,
+                    output_hidden_states=pairwise_head is not None,
+                    return_dict=True,
+                )
+                lm_loss = outputs.loss
+                pairwise_loss = None
+                raw_loss = lm_loss
+                if pairwise_head is not None:
+                    pairwise_loss, _ = compute_pairwise_auxiliary(
+                        outputs,
+                        pairwise_head,
+                        prompt_lengths,
+                        pairwise_labels,
+                    )
+                    raw_loss = combine_training_losses(
+                        lm_loss,
+                        pairwise_loss,
+                        config.training.pairwise_loss_weight,
+                    )
                 loss_value = float(raw_loss.item())
+                lm_loss_value = float(lm_loss.item())
+                pairwise_loss_value = (
+                    0.0 if pairwise_loss is None else float(pairwise_loss.item())
+                )
                 (raw_loss / config.training.gradient_accumulation_steps).backward()
             except Exception as error:
                 if not is_cuda_out_of_memory(error):
@@ -530,6 +678,11 @@ def run_training(args: argparse.Namespace) -> None:
                 accumulated = 0
                 batch = None
                 raw_loss = None
+                outputs = None
+                lm_loss = None
+                pairwise_loss = None
+                pairwise_labels = None
+                prompt_lengths = None
                 recover_from_cuda_oom(torch, optimizer)
                 print(
                     f"WARNING: CUDA OOM at epoch={epoch} batch={batch_index}; "
@@ -543,19 +696,22 @@ def run_training(args: argparse.Namespace) -> None:
                     ) from error
                 save_checkpoint(
                     model, optimizer, scheduler, config, layout,
+                    pairwise_head=pairwise_head,
                     global_step=global_step, epoch=epoch,
                     next_batch_index=batch_index + 1, metrics=metrics, reporter=reporter,
                 )
                 print(f"Saved OOM recovery checkpoint at step {global_step}")
                 continue
             running_loss += loss_value
+            running_lm_loss += lm_loss_value
+            running_pairwise_loss += pairwise_loss_value
             running_batches += 1
             accumulated += 1
             end_of_epoch = batch_index + 1 == len(loader)
             if accumulated < config.training.gradient_accumulation_steps and not end_of_epoch:
                 continue
             torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
+                trainable_parameters,
                 config.training.max_grad_norm,
             )
             optimizer.step()
@@ -568,19 +724,28 @@ def run_training(args: argparse.Namespace) -> None:
 
             if global_step == 1 or global_step % config.training.log_every_steps == 0:
                 average_loss = running_loss / max(running_batches, 1)
+                average_lm_loss = running_lm_loss / max(running_batches, 1)
+                average_pairwise_loss = (
+                    running_pairwise_loss / max(running_batches, 1)
+                )
                 elapsed_minutes = (time.perf_counter() - started) / 60
                 print(
                     f"epoch={epoch} step={global_step}/{target_steps} "
-                    f"loss={average_loss:.6f} lr={scheduler.get_last_lr()[0]:.8g} "
+                    f"loss={average_loss:.6f} lm_loss={average_lm_loss:.6f} "
+                    f"pairwise_loss={average_pairwise_loss:.6f} "
+                    f"lr={scheduler.get_last_lr()[0]:.8g} "
                     f"elapsed_min={elapsed_minutes:.1f}"
                 )
                 running_loss = 0.0
+                running_lm_loss = 0.0
+                running_pairwise_loss = 0.0
                 running_batches = 0
 
             next_batch = batch_index + 1
             if interrupt_requested:
                 save_checkpoint(
                     model, optimizer, scheduler, config, layout,
+                    pairwise_head=pairwise_head,
                     global_step=global_step, epoch=epoch,
                     next_batch_index=next_batch, metrics=metrics, reporter=reporter,
                 )
@@ -590,6 +755,7 @@ def run_training(args: argparse.Namespace) -> None:
             if global_step % config.training.save_every_steps == 0:
                 save_checkpoint(
                     model, optimizer, scheduler, config, layout,
+                    pairwise_head=pairwise_head,
                     global_step=global_step, epoch=epoch,
                     next_batch_index=next_batch, metrics=metrics, reporter=reporter,
                 )
@@ -598,9 +764,27 @@ def run_training(args: argparse.Namespace) -> None:
                 result = evaluate_rows(
                     model, processor, validation_rows, args.image_root, config, mode="generate"
                 )
+                if pairwise_head is not None:
+                    result.update(
+                        evaluate_pairwise_head(
+                            model,
+                            pairwise_head,
+                            processor,
+                            validation_rows,
+                            args.image_root,
+                            config,
+                        )
+                    )
                 metrics.append({"step": global_step, "split": "tiny_train", **result})
                 print_evaluation(f"tiny step={global_step}", result)
-                if result["exact_match_accuracy"] >= config.training.tiny_success_accuracy:
+                pairwise_pass = (
+                    pairwise_head is None
+                    or result["aux_pairwise_accuracy"] >= config.training.tiny_success_accuracy
+                )
+                if (
+                    result["exact_match_accuracy"] >= config.training.tiny_success_accuracy
+                    and pairwise_pass
+                ):
                     print(f"TINY OVERFIT PASS at step {global_step}")
                     stop = True
             elif (
@@ -623,6 +807,17 @@ def run_training(args: argparse.Namespace) -> None:
             result = evaluate_rows(
                 model, processor, epoch_validation_rows, args.image_root, config, mode="generate"
             )
+            if pairwise_head is not None:
+                result.update(
+                    evaluate_pairwise_head(
+                        model,
+                        pairwise_head,
+                        processor,
+                        epoch_validation_rows,
+                        args.image_root,
+                        config,
+                    )
+                )
             metrics.append({"step": global_step, "epoch": completed_epoch, "split": "validation_epoch", **result})
             print_evaluation(f"validation_epoch epoch={completed_epoch}", result)
             if interrupt_requested:
@@ -635,6 +830,7 @@ def run_training(args: argparse.Namespace) -> None:
                 best_score, best_pairwise, best_share = score, pairwise, share
                 save_checkpoint(
                     model, optimizer, scheduler, config, best_layout,
+                    pairwise_head=pairwise_head,
                     global_step=global_step, epoch=completed_epoch,
                     next_batch_index=0, metrics=metrics, reporter=reporter,
                 )
@@ -659,6 +855,7 @@ def run_training(args: argparse.Namespace) -> None:
         start_batch_index = 0
         save_checkpoint(
             model, optimizer, scheduler, config, layout,
+            pairwise_head=pairwise_head,
             global_step=global_step, epoch=epoch,
             next_batch_index=0, metrics=metrics, reporter=reporter,
         )

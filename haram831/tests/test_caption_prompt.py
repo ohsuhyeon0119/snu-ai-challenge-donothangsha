@@ -99,4 +99,4 @@ def test_a1_config_file_selects_punctuation_mode():
 
 def test_rejects_unknown_caption_prompt_mode():
     with pytest.raises(ValueError, match="Unsupported caption prompt mode"):
-        CaptionPromptConfig(mode="relations")
+        CaptionPromptConfig(mode="unsupported")

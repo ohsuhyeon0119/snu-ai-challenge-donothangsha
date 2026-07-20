@@ -8,7 +8,7 @@ from typing import Any
 
 from PIL import Image
 
-from ..caption_structure import render_punctuation_hints
+from ..caption_structure import render_punctuation_hints, render_relation_hints
 from ..dataset import INPUT_COLUMNS, resolve_image_paths
 from ..permutation import answer_to_chronological_order, validate_permutation
 
@@ -20,13 +20,27 @@ TASK_INSTRUCTION = (
 COMPLETION_TEMPLATE = "The correct chronological order is {order}."
 
 
-def render_instruction(sentence: str, caption_prompt_mode: str) -> str:
-    """Render either the unchanged A0 caption or the punctuation-based A1 prompt."""
+def render_instruction(
+    sentence: str,
+    caption_prompt_mode: str,
+    *,
+    relation_confidence_threshold: float = 0.7,
+    boundary_dropout: float = 0.0,
+    boundary_dropout_seed: str | int | None = None,
+) -> str:
+    """Render the unchanged A0, punctuation A1, or relation-aware A2 prompt."""
 
     if caption_prompt_mode == "raw":
         caption_context = f'Caption: "{sentence}"'
     elif caption_prompt_mode == "punctuation":
         caption_context = render_punctuation_hints(sentence)
+    elif caption_prompt_mode == "relations":
+        caption_context = render_relation_hints(
+            sentence,
+            confidence_threshold=relation_confidence_threshold,
+            boundary_dropout=boundary_dropout,
+            dropout_seed=boundary_dropout_seed,
+        )
     else:
         raise ValueError(f"Unsupported caption prompt mode: {caption_prompt_mode}")
     return f"{caption_context}\n\n{TASK_INSTRUCTION}"
@@ -39,6 +53,9 @@ def build_messages(
     min_pixels: int,
     max_pixels: int,
     caption_prompt_mode: str = "raw",
+    relation_confidence_threshold: float = 0.7,
+    boundary_dropout: float = 0.0,
+    boundary_dropout_seed: str | int | None = None,
 ) -> list[dict[str, Any]]:
     """Build one multimodal user message, preserving Input_1..Input_4 order."""
     content: list[dict[str, Any]] = []
@@ -53,10 +70,18 @@ def build_messages(
             }
         )
         content.append({"type": "text", "text": f"Image {index}"})
-    content.append({
-        "type": "text",
-        "text": render_instruction(str(row["Sentence"]), caption_prompt_mode),
-    })
+    content.append(
+        {
+            "type": "text",
+            "text": render_instruction(
+                str(row["Sentence"]),
+                caption_prompt_mode,
+                relation_confidence_threshold=relation_confidence_threshold,
+                boundary_dropout=boundary_dropout,
+                boundary_dropout_seed=boundary_dropout_seed,
+            ),
+        }
+    )
     return [{"role": "user", "content": content}]
 
 
@@ -70,6 +95,28 @@ def chronological_order_for_row(row: Mapping[str, Any]) -> tuple[int, int, int, 
     if "answer_tuple" not in row:
         raise ValueError("Training row is missing answer_tuple")
     return answer_to_chronological_order(row["answer_tuple"])
+
+
+PAIRWISE_FRAME_PAIRS: tuple[tuple[int, int], ...] = (
+    (0, 1),
+    (0, 2),
+    (0, 3),
+    (1, 2),
+    (1, 3),
+    (2, 3),
+)
+
+
+def pairwise_labels_for_row(row: Mapping[str, Any]) -> tuple[float, ...]:
+    """Return six before/after labels in canonical input-frame pair order."""
+
+    if "answer_tuple" not in row:
+        raise ValueError("Training row is missing answer_tuple")
+    answer = validate_permutation(row["answer_tuple"], name="competition answer")
+    return tuple(
+        float(answer[left] < answer[right])
+        for left, right in PAIRWISE_FRAME_PAIRS
+    )
 
 
 def target_text(order: Sequence[int]) -> str:
@@ -98,6 +145,10 @@ def collate_rows(
     max_pixels: int,
     include_labels: bool,
     caption_prompt_mode: str = "raw",
+    relation_confidence_threshold: float = 0.7,
+    boundary_dropout: float = 0.0,
+    boundary_dropout_seed: str | int | None = None,
+    include_pairwise_labels: bool = False,
 ) -> dict[str, Any]:
     """Build a right-padded multimodal batch with prompt tokens masked from loss."""
     import torch
@@ -107,12 +158,20 @@ def collate_rows(
     prompt_texts: list[str] = []
     images: list[Any] = []
     for row in rows:
+        row_dropout_seed = (
+            None
+            if boundary_dropout_seed is None
+            else f"{boundary_dropout_seed}:{row['Id']}"
+        )
         messages = build_messages(
             row,
             image_root,
             min_pixels=min_pixels,
             max_pixels=max_pixels,
             caption_prompt_mode=caption_prompt_mode,
+            relation_confidence_threshold=relation_confidence_threshold,
+            boundary_dropout=boundary_dropout,
+            boundary_dropout_seed=row_dropout_seed,
         )
         prompt = render_chat_prompt(processor, messages)
         prompt_texts.append(prompt)
@@ -147,6 +206,15 @@ def collate_rows(
         if not bool((labels != -100).any(dim=1).all().item()):
             raise ValueError("Every training sample must supervise completion tokens")
         batch["labels"] = labels.to(dtype=torch.long)
+    if include_pairwise_labels:
+        if include_labels:
+            prompt_lengths = prompt_batch["attention_mask"].sum(dim=1)
+        else:
+            prompt_lengths = batch["attention_mask"].sum(dim=1)
+        batch["prompt_lengths"] = prompt_lengths.to(dtype=torch.long)
+        batch["pairwise_labels"] = torch.tensor(
+            [pairwise_labels_for_row(row) for row in rows], dtype=torch.float32
+        )
     return batch
 
 

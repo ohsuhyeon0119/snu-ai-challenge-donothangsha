@@ -99,6 +99,10 @@ def main() -> None:
                 min_pixels=config.model.min_pixels,
                 max_pixels=config.model.max_pixels,
                 caption_prompt_mode=config.caption_prompt.mode,
+                relation_confidence_threshold=(
+                    config.caption_prompt.relation_confidence_threshold
+                ),
+                boundary_dropout=0.0,
             )
             with torch.inference_mode():
                 if args.mode == "generate":

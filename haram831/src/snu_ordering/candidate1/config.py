@@ -48,10 +48,16 @@ class LoraSettings:
 @dataclass(frozen=True)
 class CaptionPromptConfig:
     mode: str = "raw"
+    relation_confidence_threshold: float = 0.7
+    boundary_dropout: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.mode not in {"raw", "punctuation"}:
+        if self.mode not in {"raw", "punctuation", "relations"}:
             raise ValueError(f"Unsupported caption prompt mode: {self.mode}")
+        if not 0.0 <= self.relation_confidence_threshold <= 1.0:
+            raise ValueError("relation_confidence_threshold must be in [0, 1]")
+        if not 0.0 <= self.boundary_dropout < 1.0:
+            raise ValueError("boundary_dropout must be in [0, 1)")
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,7 @@ class TrainingConfig:
     tiny_subset_size: int = 16
     tiny_max_steps: int = 400
     tiny_success_accuracy: float = 0.95
+    pairwise_loss_weight: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,8 @@ class Candidate1Config:
             raise ValueError("collapse_threshold must be in (0, 1]")
         if not 0.0 < self.training.success_accuracy <= 1.0:
             raise ValueError("success_accuracy must be in (0, 1]")
+        if self.training.pairwise_loss_weight < 0.0:
+            raise ValueError("pairwise_loss_weight must be non-negative")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

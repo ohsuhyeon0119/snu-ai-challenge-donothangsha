@@ -8,6 +8,7 @@ later be rendered as prompt hints or used for bucketed evaluation.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -218,4 +219,78 @@ def render_punctuation_hints(caption: str) -> str:
             "with the four images. Use the original caption when the hints are ambiguous.",
         ]
     )
+    return "\n".join(lines)
+
+
+def _keep_boundary(*, seed: str, boundary_index: int, dropout: float) -> bool:
+    """Return a stable dropout decision independent of process hash randomization."""
+
+    digest = hashlib.sha256(f"{seed}:{boundary_index}".encode("utf-8")).digest()
+    sample = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    return sample >= dropout
+
+
+def _render_relation_edge(
+    left: str, right: str, boundary: TemporalBoundary
+) -> str:
+    marker = boundary.marker.casefold()
+    if boundary.kind == "NEXT":
+        return f"[NEXT] {left} -> {right}"
+    if boundary.kind == "BEFORE_AFTER":
+        if re.search(r"\bafter\b", marker):
+            return f"[AFTER] {left} occurs after {right}"
+        return f"[BEFORE] {left} -> {right}"
+    if boundary.kind == "OVERLAP":
+        return f"[OVERLAP] {left} || {right}"
+    if boundary.kind == "STRONG":
+        return f"[SEQUENCE] {left} -> {right}"
+    return f"[WEAK] {left} -> {right}"
+
+
+def render_relation_hints(
+    caption: str,
+    *,
+    confidence_threshold: float = 0.7,
+    boundary_dropout: float = 0.0,
+    dropout_seed: str | int | None = None,
+) -> str:
+    """Render A2 relation edges while always preserving the original caption.
+
+    Dropout is applied only when the caller passes a positive rate. The caller
+    disables it for validation and inference. A stable seed makes training
+    prompts reproducible across interrupted and resumed runs.
+    """
+
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("confidence_threshold must be between 0 and 1")
+    if not 0.0 <= boundary_dropout < 1.0:
+        raise ValueError("boundary_dropout must be in [0, 1)")
+    if boundary_dropout > 0.0 and dropout_seed is None:
+        raise ValueError("dropout_seed is required when boundary_dropout is enabled")
+
+    structure = extract_caption_structure(caption)
+    edges: list[str] = []
+    for index, boundary in enumerate(structure.boundaries):
+        if boundary.confidence < confidence_threshold:
+            continue
+        if boundary_dropout > 0.0 and not _keep_boundary(
+            seed=str(dropout_seed), boundary_index=index, dropout=boundary_dropout
+        ):
+            continue
+        edges.append(
+            _render_relation_edge(
+                structure.segments[index], structure.segments[index + 1], boundary
+            )
+        )
+
+    lines = ["Original caption:", structure.original.strip()]
+    if edges:
+        lines.extend(["", "Approximate action relations:", *edges])
+        lines.extend(
+            [
+                "",
+                "The relations are approximate. Use the original caption when "
+                "a relation is ambiguous.",
+            ]
+        )
     return "\n".join(lines)
