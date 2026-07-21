@@ -24,7 +24,7 @@ def create_pairwise_head(model: Any) -> Any:
 
 
 def compute_pairwise_auxiliary(
-    outputs: Any,
+    hidden: Any,
     pairwise_head: Any,
     prompt_lengths: Any,
     pairwise_labels: Any,
@@ -34,9 +34,6 @@ def compute_pairwise_auxiliary(
     import torch
     import torch.nn.functional as functional
 
-    if outputs.hidden_states is None:
-        raise ValueError("Model outputs must include hidden_states for pairwise training")
-    hidden = outputs.hidden_states[-1]
     if hidden.ndim != 3:
         raise ValueError("Expected hidden states with shape [batch, sequence, hidden]")
     if prompt_lengths.ndim != 1 or len(prompt_lengths) != hidden.shape[0]:

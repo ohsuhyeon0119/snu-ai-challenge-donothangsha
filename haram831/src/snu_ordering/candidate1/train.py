@@ -233,6 +233,7 @@ def evaluate_pairwise_head(
     import torch
 
     from .data import collate_rows
+    from .model import final_hidden_state
     from .pairwise import compute_pairwise_auxiliary
 
     if not rows:
@@ -261,11 +262,9 @@ def evaluate_pairwise_head(
             batch = {key: value.to(model.device) for key, value in batch.items()}
             labels = batch.pop("pairwise_labels")
             prompt_lengths = batch.pop("prompt_lengths")
-            outputs = model(
-                **batch, output_hidden_states=True, use_cache=False, return_dict=True
-            )
+            hidden = final_hidden_state(model, batch)
             loss, logits = compute_pairwise_auxiliary(
-                outputs, pairwise_head, prompt_lengths, labels
+                hidden, pairwise_head, prompt_lengths, labels
             )
             total_loss += float(loss.item())
             predictions = logits >= 0
@@ -419,6 +418,11 @@ def parse_args(default_tiny: bool = False) -> argparse.Namespace:
     parser.add_argument("--relation-confidence-threshold", type=float)
     parser.add_argument("--boundary-dropout", type=float)
     parser.add_argument("--pairwise-loss-weight", type=float)
+    parser.add_argument(
+        "--profile-memory",
+        action="store_true",
+        help="Record first-batch tensor shapes and CUDA memory checkpoints",
+    )
     return parser.parse_args()
 
 
@@ -491,6 +495,7 @@ def run_training(args: argparse.Namespace) -> None:
     from .data import collate_rows
     from .memory import GpuMemoryReporter
     from .model import (
+        completion_only_training_forward,
         load_processor,
         load_resumed_training_model,
         load_training_model,
@@ -641,21 +646,46 @@ def run_training(args: argparse.Namespace) -> None:
                 break
             try:
                 batch = {key: value.to(model.device) for key, value in batch.items()}
+                profile_batch = (
+                    getattr(args, "profile_memory", False)
+                    and global_step == 0
+                    and accumulated == 0
+                )
+                if profile_batch:
+                    reporter.record_batch("first_batch", batch)
+                    reporter.record_current("first_batch_on_device")
                 pairwise_labels = batch.pop("pairwise_labels", None)
                 prompt_lengths = batch.pop("prompt_lengths", None)
                 if global_step == 0 and accumulated == 0:
                     reporter.reset_peak()
-                outputs = model(
-                    **batch,
-                    output_hidden_states=pairwise_head is not None,
-                    return_dict=True,
-                )
-                lm_loss = outputs.loss
+                final_hidden = None
+                forward_stats = None
+                if pairwise_head is None:
+                    outputs = model(**batch, return_dict=True)
+                    lm_loss = outputs.loss
+                else:
+                    outputs = None
+                    lm_loss, final_hidden, forward_stats = completion_only_training_forward(
+                        model, batch
+                    )
+                if profile_batch:
+                    if forward_stats is not None:
+                        reporter.record_values(
+                            "first_forward_work",
+                            {
+                                **forward_stats,
+                                "avoided_logit_rows": (
+                                    forward_stats["sequence_tokens"]
+                                    - forward_stats["logit_rows"]
+                                ),
+                            },
+                        )
+                    reporter.record_current("after_first_forward")
                 pairwise_loss = None
                 raw_loss = lm_loss
                 if pairwise_head is not None:
                     pairwise_loss, _ = compute_pairwise_auxiliary(
-                        outputs,
+                        final_hidden,
                         pairwise_head,
                         prompt_lengths,
                         pairwise_labels,
@@ -665,20 +695,31 @@ def run_training(args: argparse.Namespace) -> None:
                         pairwise_loss,
                         config.training.pairwise_loss_weight,
                     )
+                    if profile_batch:
+                        reporter.record_current("after_first_pairwise_loss")
                 loss_value = float(raw_loss.item())
                 lm_loss_value = float(lm_loss.item())
                 pairwise_loss_value = (
                     0.0 if pairwise_loss is None else float(pairwise_loss.item())
                 )
                 (raw_loss / config.training.gradient_accumulation_steps).backward()
+                if profile_batch:
+                    reporter.record_peak("peak_first_forward_backward")
             except Exception as error:
                 if not is_cuda_out_of_memory(error):
                     raise
                 oom_skips += 1
+                if torch.cuda.is_available():
+                    try:
+                        reporter.record_peak(f"oom_peak_{oom_skips}")
+                    except RuntimeError:
+                        # Preserve the original OOM even if synchronization also fails.
+                        pass
                 accumulated = 0
                 batch = None
                 raw_loss = None
                 outputs = None
+                final_hidden = None
                 lm_loss = None
                 pairwise_loss = None
                 pairwise_labels = None
@@ -692,7 +733,7 @@ def run_training(args: argparse.Namespace) -> None:
                 if oom_skips > MAX_OOM_SKIPS:
                     raise RuntimeError(
                         f"CUDA OOM occurred more than {MAX_OOM_SKIPS} times; "
-                        "reduce model.max_pixels before resuming"
+                        "rerun a short job with --profile-memory and inspect memory_report.json"
                     ) from error
                 save_checkpoint(
                     model, optimizer, scheduler, config, layout,

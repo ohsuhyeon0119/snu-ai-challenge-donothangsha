@@ -99,6 +99,86 @@ def load_training_model(config: Candidate1Config, *, local_files_only: bool = Fa
     return _enable_training_features(get_peft_model(base, lora_config), config)
 
 
+def _causal_lm_base(model: Any) -> Any:
+    """Return the adapter-injected causal LM without disabling active LoRA modules."""
+
+    base = model.get_base_model() if hasattr(model, "get_base_model") else model
+    if not hasattr(base, "model") or not hasattr(base, "lm_head"):
+        raise ValueError(
+            "Candidate1 optimized training requires a causal LM with model and lm_head modules"
+        )
+    return base
+
+
+def final_hidden_state(model: Any, model_inputs: dict[str, Any]) -> Any:
+    """Run one multimodal backbone pass and return only the final decoder state.
+
+    Calling the Qwen backbone directly avoids both the full-vocabulary logits and
+    the tuple of every decoder layer's hidden state. LoRA layers remain active
+    because PEFT injects them into the returned base model in place.
+    """
+
+    base = _causal_lm_base(model)
+    outputs = base.model(
+        **model_inputs,
+        use_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=True,
+    )
+    hidden = getattr(outputs, "last_hidden_state", None)
+    if hidden is None:
+        hidden = outputs[0]
+    if hidden.ndim != 3:
+        raise ValueError("Expected final hidden state with shape [batch, sequence, hidden]")
+    return hidden
+
+
+def completion_only_training_forward(
+    model: Any, batch: dict[str, Any]
+) -> tuple[Any, Any, dict[str, int]]:
+    """Compute causal-LM loss without materializing prompt/image-token logits.
+
+    The collator masks prompt and padding labels with ``-100``. For causal LM
+    training, hidden position ``t`` predicts label ``t + 1``; therefore only
+    states whose shifted labels are supervised need to pass through ``lm_head``.
+    The complete final hidden tensor is returned for A2's prompt-boundary
+    pairwise auxiliary loss.
+    """
+
+    import torch.nn.functional as functional
+
+    labels = batch.get("labels")
+    if labels is None:
+        raise ValueError("completion-only training requires labels")
+    if labels.ndim != 2:
+        raise ValueError("labels must have shape [batch, sequence]")
+
+    model_inputs = {key: value for key, value in batch.items() if key != "labels"}
+    hidden = final_hidden_state(model, model_inputs)
+    if tuple(hidden.shape[:2]) != tuple(labels.shape):
+        raise ValueError("labels must match the final hidden batch and sequence dimensions")
+
+    shifted_labels = labels[:, 1:].contiguous()
+    supervised_mask = shifted_labels.ne(-100)
+    supervised_tokens = int(supervised_mask.sum().item())
+    if supervised_tokens == 0:
+        raise ValueError("completion-only training found no supervised target tokens")
+
+    prediction_hidden = hidden[:, :-1, :][supervised_mask]
+    targets = shifted_labels[supervised_mask].to(prediction_hidden.device)
+    base = _causal_lm_base(model)
+    logits = base.lm_head(prediction_hidden)
+    loss = functional.cross_entropy(logits.float(), targets)
+    stats = {
+        "sequence_tokens": int(labels.numel()),
+        "supervised_tokens": supervised_tokens,
+        "logit_rows": int(logits.shape[0]),
+        "vocabulary_size": int(logits.shape[-1]),
+    }
+    return loss, hidden, stats
+
+
 def validate_trainable_parameters(model: Any) -> None:
     trainable = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     if not trainable or not any("lora_" in name for name in trainable):

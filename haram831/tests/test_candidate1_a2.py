@@ -7,6 +7,7 @@ import pytest
 from snu_ordering.caption_structure import render_relation_hints
 from snu_ordering.candidate1.config import CaptionPromptConfig, Candidate1Config
 from snu_ordering.candidate1.data import pairwise_labels_for_row, render_instruction
+from snu_ordering.candidate1.model import completion_only_training_forward
 from snu_ordering.candidate1.pairwise import (
     combine_training_losses,
     compute_pairwise_auxiliary,
@@ -83,7 +84,6 @@ def test_pairwise_labels_cover_all_six_frame_pairs_for_every_permutation():
 def test_pairwise_auxiliary_uses_final_prompt_token_and_backpropagates():
     torch = pytest.importorskip("torch")
     hidden = torch.randn(2, 5, 4, requires_grad=True)
-    outputs = SimpleNamespace(hidden_states=(hidden,))
     head = torch.nn.Linear(4, 6)
     prompt_lengths = torch.tensor([3, 5])
     labels = torch.tensor(
@@ -91,7 +91,7 @@ def test_pairwise_auxiliary_uses_final_prompt_token_and_backpropagates():
     )
 
     pairwise_loss, logits = compute_pairwise_auxiliary(
-        outputs, head, prompt_lengths, labels
+        hidden, head, prompt_lengths, labels
     )
     lm_loss = torch.tensor(2.0, requires_grad=True)
     total = combine_training_losses(lm_loss, pairwise_loss, 0.3)
@@ -102,6 +102,81 @@ def test_pairwise_auxiliary_uses_final_prompt_token_and_backpropagates():
     assert hidden.grad is not None
     assert head.weight.grad is not None
     assert lm_loss.grad.item() == pytest.approx(1.0)
+
+
+def test_completion_only_forward_matches_full_causal_lm_loss_and_backpropagates():
+    torch = pytest.importorskip("torch")
+    functional = pytest.importorskip("torch.nn.functional")
+
+    class RecordingHead(torch.nn.Linear):
+        def forward(self, values):
+            self.last_input_shape = tuple(values.shape)
+            return super().forward(values)
+
+    class Backbone(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embedding = torch.nn.Embedding(20, 5)
+            self.forward_kwargs = None
+
+        def forward(self, input_ids, **kwargs):
+            self.forward_kwargs = kwargs
+            return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+    class CausalLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = RecordingHead(5, 20, bias=False)
+
+    class PeftLikeWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.base = CausalLM()
+
+        def get_base_model(self):
+            return self.base
+
+    model = PeftLikeWrapper()
+    input_ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 0]])
+    attention_mask = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
+    labels = torch.tensor(
+        [[-100, -100, 3, 4, 5], [-100, -100, -100, 9, -100]]
+    )
+
+    expected_hidden = model.base.model.embedding(input_ids)
+    expected_logits = model.base.lm_head(expected_hidden)
+    shifted = functional.pad(labels, (0, 1), value=-100)[..., 1:]
+    expected_loss = functional.cross_entropy(
+        expected_logits.float().reshape(-1, 20),
+        shifted.reshape(-1),
+        ignore_index=-100,
+    )
+
+    loss, hidden, stats = completion_only_training_forward(
+        model,
+        {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        },
+    )
+    loss.backward()
+
+    assert loss.item() == pytest.approx(expected_loss.item())
+    assert hidden.shape == (2, 5, 5)
+    assert model.base.lm_head.last_input_shape == (4, 5)
+    assert stats == {
+        "sequence_tokens": 10,
+        "supervised_tokens": 4,
+        "logit_rows": 4,
+        "vocabulary_size": 20,
+    }
+    assert model.base.model.forward_kwargs["output_hidden_states"] is False
+    assert model.base.model.forward_kwargs["use_cache"] is False
+    assert "labels" not in model.base.model.forward_kwargs
+    assert model.base.model.embedding.weight.grad is not None
+    assert model.base.lm_head.weight.grad is not None
 
 
 def test_pairwise_head_safetensors_round_trip(tmp_path):

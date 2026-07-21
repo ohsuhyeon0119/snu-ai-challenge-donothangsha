@@ -17,6 +17,25 @@ Greedy generation and best-checkpoint selection remain unchanged. The pairwise
 head is saved for reproducible resume and diagnostics, but final inference does
 not load or use it.
 
+## Memory-efficient joint loss
+
+A2 runs the four images through the multimodal backbone once. It does not run
+six image-pair forwards. During training, the implementation requests only the
+final decoder hidden state, applies the language-model head only at supervised
+completion positions, and reuses the prompt-boundary vector for the six
+pairwise logits. This avoids retaining every decoder layer's hidden-state tuple
+and avoids full-vocabulary logits for image and prompt tokens.
+
+To capture first-batch tensor shapes and synchronized CUDA memory checkpoints,
+add `--profile-memory` to a tiny or short training run. Measurements are written
+to the run's `memory_report.json`; this mode is intended for diagnosis rather than a
+full training run.
+
+The controlled A/B/C/D diagnosis is available through
+`snu_ordering.candidate1.memory_ablation`. Run each mode in a fresh process with
+the same `--sample-id`; each JSON report records tensor shapes, returned hidden
+layers, avoided logit rows, stage memory, and either `success` or `oom`.
+
 ## Tiny overfit
 
 ```bash
