@@ -1,0 +1,23 @@
+# python venv
+venv/
+__pycache__/
+*.py[cod]
+
+# docs
+docs/*
+!docs/VAST_LOCAL_MODEL_UPLOAD.md
+!docs/OVERNIGHT_PALIGEMMA_RUN.md
+
+# local outputs and competition artifacts
+outputs/
+paligemma_run_20000_outputs.tar.gz
+data/
+snu_data.tar
+local_models/
+models/
+*.tar
+*.pt
+*.pth
+*.safetensors
+*.bin
+.env
