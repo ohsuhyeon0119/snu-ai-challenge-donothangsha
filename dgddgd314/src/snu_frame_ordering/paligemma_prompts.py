@@ -1,6 +1,7 @@
 PROMPT_TEMPLATE = (
     "caption: {sentence}\n"
-    "The image is a 2x2 grid of four shuffled video frames labeled Image 1 to Image 4. "
+    "Four images are provided before this text. Treat them, in order, as Image 1, "
+    "Image 2, Image 3, and Image 4. They are shuffled frames from one video. "
     "The caption describes the video in chronological order. "
     "Return only the chronological order as a Python list of image numbers."
 )
@@ -8,4 +9,3 @@ PROMPT_TEMPLATE = (
 
 def build_prompt(sentence):
     return PROMPT_TEMPLATE.format(sentence=sentence)
-

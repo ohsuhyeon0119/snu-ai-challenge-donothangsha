@@ -29,13 +29,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Download a Hugging Face model snapshot locally and optionally package it for upload."
     )
-    parser.add_argument("--repo-id", default="google/paligemma-3b-pt-448")
+    parser.add_argument("--repo-id", default="google/paligemma2-10b-pt-224")
     parser.add_argument("--revision", default=None)
     parser.add_argument("--out-dir", default=None)
     parser.add_argument("--cache-dir", default="local_models/.hf_cache")
     parser.add_argument("--archive", default=None)
     parser.add_argument("--token", default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--no-archive", action="store_true")
+    parser.add_argument("--skip-if-exists", action="store_true")
     args = parser.parse_args()
 
     from huggingface_hub import snapshot_download
@@ -45,6 +46,10 @@ def main():
     cache_dir = Path(args.cache_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.skip_if_exists and (out_dir / "config.json").exists():
+        print(f"Using existing model at: {out_dir.resolve()}")
+        return
 
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 

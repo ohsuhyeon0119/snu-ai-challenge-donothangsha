@@ -1,24 +1,34 @@
 # Image Processing Notes
 
-이미지 처리 관련 코드는 항상 남긴다. PaliGemma 실험에서는 4개 프레임을 단일 이미지 입력으로 바꾸는 과정이 모델 성능과 재현성에 직접 영향을 주므로, 생성 방식과 산출물을 추적한다.
+Main path: true PaliGemma multi-image input.
 
-현재 방식:
+For each row, the four frame files are opened as RGB PIL images and passed to the processor as one sample:
 
-- `Input_1`~`Input_4`를 2x2 contact sheet 한 장으로 합친다.
-- 각 칸 상단에 `Image 1`~`Image 4` 라벨을 박는다.
-- 기본 contact sheet 크기는 448x448이다.
-- 각 프레임은 비율을 유지해 칸 안에 넣고, EXIF orientation을 반영한다.
+```python
+processor(images=[[img1, img2, img3, img4]], text=[prompt], suffix=[answer])
+```
 
-관련 코드:
+The image order inside the nested list defines the displayed labels used by the prompt:
 
-- `src/snu_frame_ordering/contact_sheet.py`
-- `scripts/paligemma_make_sheet.py`
-- `scripts/audit_data.py`
+- first image -> Image 1
+- second image -> Image 2
+- third image -> Image 3
+- fourth image -> Image 4
 
-운영 규칙:
+Presentation shuffle augmentation changes that nested-list order with `SIGMAS`; labels are remapped into slot-space with `slot_order`.
 
-- contact sheet 생성 로직을 임시 코드로 두지 말고 repo에 유지한다.
-- 이미지 audit 결과는 `outputs/`에 저장한다. `outputs/`는 gitignore 대상이지만, 실험 기록에는 파일명과 생성 명령을 남긴다.
-- contact sheet 크기, 라벨 방식, crop/resize 정책을 바꾸면 `PALIGEMMA_PLAN.md`와 이 파일에 이유를 기록한다.
-- 학습/추론에서 사용한 이미지 전처리 방식은 보고서에 그대로 옮길 수 있어야 한다.
+## Current Defaults
 
+- Main model: `google/paligemma2-10b-pt-224`
+- Override with `SNU_MODEL` for 3B smoke tests or 448 experiments.
+- Main inference: 24-candidate likelihood scoring with `SNU_TTA_K` presentation TTA.
+- Contact sheet utilities remain only as fallback/debug tooling.
+
+## Relevant Files
+
+- `src/snu_frame_ordering/paligemma_common.py`
+- `src/snu_frame_ordering/orders.py`
+- `scripts/paligemma_smoke.py`
+- `scripts/paligemma_train_skeleton.py`
+- `scripts/paligemma_infer.py`
+- `scripts/clean_data.py`
