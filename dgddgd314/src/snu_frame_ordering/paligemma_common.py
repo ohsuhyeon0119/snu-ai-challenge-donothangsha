@@ -82,13 +82,18 @@ def lora_target_modules(model):
     if not names:
         raise RuntimeError("No language-decoder LoRA target modules found")
     return names
+
+def prompt_for_images(images, sentence):
+    image_count = len(images) if isinstance(images, (list, tuple)) else 1
+    return "<image>" * image_count + "\n" + build_prompt(sentence)
+
 def encode_prompt(processor, images, sentence, return_tensors="pt"):
-    prompt = build_prompt(sentence)
+    prompt = prompt_for_images(images, sentence)
     return processor(text=[prompt], images=[images], return_tensors=return_tensors)
 
 
 def encode_supervised(processor, images, sentence, completion):
-    prompt = build_prompt(sentence)
+    prompt = prompt_for_images(images, sentence)
     return processor(
         text=[prompt],
         images=[images],
@@ -99,7 +104,7 @@ def encode_supervised(processor, images, sentence, completion):
 
 
 def score_candidate_orders(model, processor, images, sentence, candidate_orders, chunk=SCORE_CHUNK):
-    prompt = build_prompt(sentence)
+    prompt = prompt_for_images(images, sentence)
     device = model_device(model)
     scores = []
 
