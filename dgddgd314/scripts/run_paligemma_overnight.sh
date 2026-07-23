@@ -4,10 +4,11 @@ set -euo pipefail
 cd "${SNU_REPO_DIR:-/workspace/project/dgddgd314}"
 
 export SNU_DATA_DIR="${SNU_DATA_DIR:-/workspace/project/dgddgd314/data/snuaichallenge_data}"
-export SNU_MODEL="${SNU_MODEL:-/workspace/models/paligemma-3b-pt-448}"
+export SNU_MODEL="${SNU_MODEL:-/workspace/models/paligemma2-10b-pt-224}"
 export SNU_ADAPTER_DIR="${SNU_ADAPTER_DIR:-/workspace/project/dgddgd314/outputs/paligemma_lora_overnight}"
 export SNU_CONTACT_SHEET_SIZE="${SNU_CONTACT_SHEET_SIZE:-448}"
 export SNU_SCORE_CHUNK="${SNU_SCORE_CHUNK:-1}"
+export SNU_TTA_K="${SNU_TTA_K:-3}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -48,7 +49,7 @@ echo "== infer =="
 echo "adapter_for_infer: ${SNU_ADAPTER_DIR}"
 echo "submission: ${SUBMISSION_OUT}"
 
-"${PYTHON_BIN}" scripts/paligemma_infer.py --out "${SUBMISSION_OUT}"
+"${PYTHON_BIN}" scripts/paligemma_infer.py --out "${SUBMISSION_OUT}" --tta-k "${SNU_TTA_K}" --score-chunk "${SNU_SCORE_CHUNK}"
 "${PYTHON_BIN}" scripts/validate_submission.py --data-dir "${SNU_DATA_DIR}" --submission "${SUBMISSION_OUT}"
 
 "${PYTHON_BIN}" -c "import pandas as pd; p='${SUBMISSION_OUT}'; df=pd.read_csv(p); print('rows:', len(df)); print('unique answers:', df['Answer'].nunique()); print(df['Answer'].value_counts().head(24)); print(df.head(10).to_string(index=False))" | tee outputs/overnight_submission_stats.txt

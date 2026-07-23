@@ -26,19 +26,27 @@ def parse_answer(value):
     return ast.literal_eval(value)
 
 
+
+def sigma_for(sample_id, epoch, seed):
+    import hashlib
+
+    from snu_frame_ordering.orders import SIGMAS
+
+    digest = hashlib.sha1(f"{seed}:{epoch}:{sample_id}".encode("utf-8")).digest()
+    return SIGMAS[digest[0] % len(SIGMAS)]
+
 def evaluate_exact_match(model, processor, rows, score_chunk):
     from tqdm import tqdm
 
     from snu_frame_ordering.orders import image_order_from_answer
-    from snu_frame_ordering.paligemma_common import row_contact_sheet, score_orders
+    from snu_frame_ordering.paligemma_common import predict_order
 
     model.eval()
     correct = 0
     total = 0
     for row in tqdm(rows, desc="val", leave=False):
-        image = row_contact_sheet(row, "train")
         expected = image_order_from_answer(parse_answer(row["Answer"]))
-        predicted = score_orders(model, processor, image, row["Sentence"], chunk=score_chunk)
+        predicted = predict_order(model, processor, row, "train", tta_k=1, chunk=score_chunk)
         correct += int(predicted == expected)
         total += 1
     model.train()
@@ -114,12 +122,14 @@ def main():
     from torch.utils.data import DataLoader
     from tqdm import tqdm
 
-    from snu_frame_ordering.orders import image_order_from_answer, target_text
+    from snu_frame_ordering.orders import image_order_from_answer, slot_order, target_text
     from snu_frame_ordering.paligemma_common import (
         encode_supervised,
         load_base_model,
         load_processor,
-        row_contact_sheet,
+        lora_target_modules,
+        model_device,
+        row_images,
     )
 
     random.seed(args.seed)
@@ -142,7 +152,7 @@ def main():
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules=lora_target_modules(model),
     )
     model = get_peft_model(model, config)
     model.train()
@@ -176,11 +186,12 @@ def main():
             loader = DataLoader(FrameOrderingDataset(train_rows), batch_size=1, shuffle=False, collate_fn=lambda x: x[0])
 
             for row in loader:
-                image = row_contact_sheet(row, "train")
+                sigma = sigma_for(row["Id"], epoch, args.seed)
+                images = row_images(row, "train", sigma=sigma)
                 answer = parse_answer(row["Answer"])
                 image_order = image_order_from_answer(answer)
-                completion = target_text(image_order)
-                batch = encode_supervised(processor, image, row["Sentence"], completion).to(model.device)
+                completion = target_text(slot_order(image_order, sigma))
+                batch = encode_supervised(processor, images, row["Sentence"], completion).to(model_device(model))
                 loss = model(**batch).loss
                 loss.backward()
                 optimizer.step()

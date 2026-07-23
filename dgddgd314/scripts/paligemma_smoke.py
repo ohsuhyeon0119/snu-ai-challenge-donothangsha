@@ -1,4 +1,5 @@
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default=os.environ.get("SNU_DATA_DIR", "data/snuaichallenge_data"))
     parser.add_argument("--no-load-model", action="store_true")
     args = parser.parse_args()
 
@@ -27,4 +29,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
