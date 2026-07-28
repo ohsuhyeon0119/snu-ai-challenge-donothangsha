@@ -10,10 +10,7 @@
   하나의 학습에 통합(Stage 1) → error analysis가 지목한 순수 시각 추론 병목을
   **vision encoder LoRA**로 해소(Stage 2, 최종 도약).
 
-> **재현 가능한 최종 제출 코드는 [`submit/`](submit/) 폴더에 정리되어 있습니다.**
-> 이 문서는 최상위 안내이며, 아래 3~5절의 실행 명령은 모두 `submit/` 폴더 안에서
-> 실행하는 것을 전제로 합니다(`cd submit`).
-> 방법론 상세는 별도 제출한 방법론 보고서(PDF)를 참고.
+방법론 상세는 별도 제출한 방법론 보고서(PDF)를 참고.
 
 ---
 
@@ -21,32 +18,29 @@
 
 ```
 .
-├── README.md                  # 이 문서 (최상위 안내: 환경·설치·실행·재현)
-├── submit/                    # ▶ 재현 가능한 최종 제출 코드 (아래 모두 이 안)
-│   ├── README.md              #   submit 폴더 상세 설명(동일 내용)
-│   ├── requirements.txt       #   고정 라이브러리 버전
-│   ├── setup.sh               #   의존성 설치 + 베이스 모델 다운로드
-│   ├── download_weights.py    #   최종 LoRA 어댑터 자동 다운로드 (Google Drive)
-│   │
-│   ├── common.py              #   모델 로드(NF4), 순열 수학, 24-way scorer,
-│   │                          #     listwise 후보 구성, identity prior,
-│   │                          #     vision LoRA 대상/gradient hook
-│   ├── clean_data.py          #   [데이터] 검은/중복 프레임 정제
-│   ├── make_split.py          #   [데이터] 최종 학습/검증 분할 (seed 42)
-│   │
-│   ├── train.py               #   SFT 학습 유틸 — 재사용 모듈
-│   ├── train_unified.py       #   [Stage 1] SFT+listwise 통합 학습 (→ LB 0.90924)
-│   ├── train_vision.py        #   [Stage 2] vision encoder LoRA (→ LB 0.92146, 최종)
-│   ├── infer.py               #   24-way 추론 → 제출 CSV
-│   │
-│   ├── test_perms.py          #   순열/후보 수학 CPU 단위테스트
-│   ├── smoke_unified.py       #   [GPU 사전점검] Stage 1
-│   ├── smoke_vision.py        #   [GPU 사전점검] Stage 2 (vision LoRA gradient 흐름)
-│   │
-│   ├── data_work/train_flags.csv   # 정제 플래그(검은/중복)
-│   └── weights/               #   download_weights.py 가 어댑터를 받아 푸는 위치
+├── README.md              # 이 문서 (환경·설치·실행·재현 안내)
+├── requirements.txt       # 고정 라이브러리 버전
+├── setup.sh               # 의존성 설치 + 베이스 모델 다운로드
+├── download_weights.py    # 최종 LoRA 어댑터 자동 다운로드 (Google Drive)
 │
-└── dgddgd314/                 # (참고) 팀원의 별도 탐색 작업 — 최종 제출과 무관
+├── common.py              # 모델 로드(NF4), 순열 수학, 24-way scorer,
+│                          #   listwise 후보 구성, identity prior,
+│                          #   vision LoRA 대상/gradient hook
+├── clean_data.py          # [데이터] 검은/중복 프레임 정제 → train_clean/clean_val
+├── make_split.py          # [데이터] 최종 학습/검증 분할 (seed 42)
+│
+├── train.py               # SFT 학습 유틸(collate/monitor/checkpoint) — 재사용 모듈
+├── train_unified.py       # [Stage 1] SFT+listwise 통합 학습 (베이스 → LB 0.90924)
+├── train_vision.py        # [Stage 2] vision encoder LoRA (Stage1 → LB 0.92146, 최종)
+├── infer.py               # 24-way 추론 → 제출 CSV
+│
+├── test_perms.py          # 순열/후보 구성 수학 CPU 단위테스트
+├── smoke_unified.py       # [GPU 사전점검] Stage 1 (SFT+listwise 동작)
+├── smoke_vision.py        # [GPU 사전점검] Stage 2 (vision LoRA gradient 흐름)
+│
+├── data_work/
+│   └── train_flags.csv    # 정제 플래그(검은/중복) — clean_data.py 재실행 시 재생성됨
+└── weights/               # download_weights.py 가 어댑터를 받아 푸는 위치
 ```
 
 ---
@@ -69,16 +63,14 @@
 - **핵심 라이브러리(고정)**: `torch==2.12.0(+cu130)`, `transformers==5.14.1`,
   `peft==0.19.1`, `accelerate==1.14.0`, `bitsandbytes>=0.43`,
   `qwen-vl-utils==0.0.14`, `safetensors`, `pandas`, `numpy`, `pillow`, `gdown`
-- 전체 목록·핀은 [`submit/requirements.txt`](submit/requirements.txt) 참조.
-  `transformers 5.14`의 Qwen3-VL M-RoPE / KV-cache 동작에 코드가 의존하므로
-  **해당 버전 고정을 권장**한다.
+- 전체 목록·핀은 `requirements.txt` 참조. `transformers 5.14`의 Qwen3-VL
+  M-RoPE / KV-cache 동작에 코드가 의존하므로 **해당 버전 고정을 권장**한다.
 
 ---
 
 ## 3. 설치
 
 ```bash
-cd submit
 bash setup.sh
 # = torch 설치 + requirements.txt 설치 + Qwen3-VL-32B-Instruct 사전 다운로드(약 65GB)
 ```
@@ -86,7 +78,6 @@ bash setup.sh
 수동으로 하려면:
 
 ```bash
-cd submit
 pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
 python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-VL-32B-Instruct')"
@@ -109,45 +100,49 @@ data/
 정제·분할을 재생성한다(제공 데이터만 사용, 규칙 3.4 준수):
 
 ```bash
-cd submit
-SNU_DATA_DIR=data python clean_data.py   # 검은/중복 프레임 정제 → data_work/train_clean.csv, clean_val.csv
-python make_split.py                     # 최종 분할 → data_work/train_full.csv(8,871), val_small.csv(250)
+# (1) 검은/중복 프레임 정제 → data_work/train_clean.csv, clean_val.csv, train_flags.csv
+SNU_DATA_DIR=data python clean_data.py
+
+# (2) 최종 학습/검증 분할 → data_work/train_full.csv(8,871), val_small.csv(250)
+python make_split.py
 ```
 
 정제 결과: 검은 프레임 260 + 중복 프레임 209 = **414행(4.3%)** 제거
 → `train_clean` 8,121 / `clean_val` 1,000 → 최종 `train_full` 8,871 / `val_small` 250.
+(`data_work/train_flags.csv`에 정제 플래그가 포함되어 있어 정제 결과를 바로 검토할 수 있다.)
 
 ---
 
 ## 5. 재현 방법
 
-두 경로를 제공한다. **A는 빠른 재현(추론만)**, **B는 처음부터 전체 재학습.** (모두 `cd submit` 후 실행)
+두 가지 경로를 제공한다. **A는 빠른 재현(추론만)**, **B는 처음부터 전체 재학습.**
 
 ### A. 최종 가중치로 추론만 (권장, 빠름)
 
 ```bash
-cd submit
-python download_weights.py     # 최종 LoRA 어댑터 다운로드 → weights/vision_best
+# (1) 최종 LoRA 어댑터 다운로드 (Google Drive → weights/vision_best)
+python download_weights.py
 
+# (2) 24-way 추론 → 제출 CSV
 SNU_DATA_DIR=data SNU_ADAPTER_DIR=weights/vision_best \
   SNU_SPLIT=test SNU_TTA_K=3 SNU_PRIOR_ALPHA=0.5 \
   SNU_OUT=submission.csv python infer.py
 ```
 
-> **가중치 다운로드 링크** — 최종 vision-LoRA 어댑터(약 1.1GB, LB 0.92146)는
-> Google Drive에 보관한다. `submit/download_weights.py`가 아래 파일을 자동으로
-> 내려받아 압축 해제한다.
+> **가중치 다운로드 링크**: 최종 vision-LoRA 어댑터(약 1.1GB, LB 0.92146)는
+> Google Drive에 보관한다. `download_weights.py`가 아래 파일을 자동으로 내려받아
+> 압축 해제한다.
 >
 > - **최종 어댑터 (LB 0.92146)**: https://drive.google.com/file/d/1PA8IpD8Z552WIbgMZKEYDkRi9N4rr1tv/view?usp=sharing
 
 ### B. 처음부터 전체 재학습
 
 ```bash
-cd submit
-# (0) 사전점검 (권장)
-python test_perms.py                                       # CPU
-SNU_DATA_DIR=data python smoke_unified.py                  # GPU: Stage 1
-SNU_DATA_DIR=data SNU_INIT_ADAPTER=ckpts_unified/ckpt-<N> python smoke_vision.py   # GPU: Stage 2
+# (0) GPU 사전점검 (선택이지만 권장 — 몇 분)
+python test_perms.py                                   # CPU: 순열/후보 수학
+SNU_DATA_DIR=data python smoke_unified.py              # GPU: Stage 1 동작
+SNU_DATA_DIR=data python smoke_vision.py \
+  SNU_INIT_ADAPTER=ckpts_unified/ckpt-<N>              # GPU: Stage 2 gradient 흐름
 
 # (1) Stage 1 — SFT+listwise 통합 학습 (베이스 → ckpts_unified/ckpt-<N>)
 SNU_DATA_DIR=data python train_unified.py
