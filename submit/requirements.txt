@@ -1,4 +1,4 @@
-# donothangsha — SNU AI Challenge 2026 (프레임 순서 복원)
+# 하라는행샤는안하고 — SNU AI Challenge 2026 (프레임 순서 복원)
 # 최종 LB 0.92146 파이프라인이 검증된 버전. transformers 5.14의 Qwen3-VL
 # M-RoPE / KV-cache 동작에 코드가 의존하므로 아래 버전을 그대로 고정한다.
 #

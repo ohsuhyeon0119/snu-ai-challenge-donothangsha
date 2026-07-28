@@ -1,9 +1,9 @@
-# donothangsha — 텍스트로 풀어보는 장면의 재구성 (SNU AI Challenge 2026)
+# 하라는행샤는안하고 — 텍스트로 풀어보는 장면의 재구성 (SNU AI Challenge 2026)
 
 캡션과 무작위로 뒤섞인 4개의 비디오 프레임을 입력받아 원래 시간 순서를 복원하는
 과제. 평가 지표는 Exact Match Accuracy(24개 순열 중 완전 일치).
 
-- **팀**: donothangsha (오수현, 김하람, 권성안)
+- **팀**: 하라는행샤는안하고 (오수현, 김하람, 권성안)
 - **기반 모델**: Qwen/Qwen3-VL-32B-Instruct (NF4 4-bit + LoRA)
 - **최종 성적**: Public LB **0.92146**
 - **접근 요약**: 문제를 24-way 순열 선택으로 재정의 → SFT와 listwise ranking을
